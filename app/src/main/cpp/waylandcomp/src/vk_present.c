@@ -35,6 +35,7 @@ struct vkp_image {
     int in_general;           /* shm images: moved from PREINITIALIZED to GENERAL */
     VkFormat fmt;
     int sampled;              /* created with SAMPLED usage: the alpha pass can read it */
+    struct vkp_image *next_dead; /* destroyed while our work was still on the GPU (g_dead) */
 };
 
 static ANativeWindow *g_window;  /* the window frames go to; compositor thread only */
@@ -117,6 +118,85 @@ static VkResult timed_wait(VkFence fence, uint64_t timeout) {
     int64_t t0 = perf_now();
     VkResult r = g_vk.WaitForFences(g_dev, 1, &fence, VK_TRUE, timeout);
     perf_add(&g_perf.wait_ns, &g_perf.wait_max_ns, &g_perf.waits, perf_now() - t0);
+    return r;
+}
+
+/* g_fence and command buffer slot 0 are shared by every path that submits here: a frame, a layer copy,
+ * the layer effects pass, a cursor read-back, the letterbox image's clear. Each waits for its own work,
+ * but all except the frame give up after a second - and then that work is still on the GPU. Until it
+ * has finished, the fence and the command buffer must not be reset, and no image it reads or writes
+ * may be destroyed (VUID-vkResetFences-pFences-01123, VUID-vkResetCommandBuffer-commandBuffer-00045,
+ * VUID-vkDestroyImage-image-01000). g_fence_busy says such work may be in flight: the next use asks the
+ * fence (never waits) and is skipped while it still runs, and images destroyed meanwhile wait in g_dead.
+ * A device that is lost answers DEVICE_LOST here, which stops presenting as everywhere else. */
+static int g_fence_busy;
+static struct vkp_image *g_dead;
+static int g_busy_said;
+static void device_lost(const char *where);
+static void image_free(struct vkp_image *img);
+
+static void reap_dead(void) {
+    while (g_dead) {
+        struct vkp_image *img = g_dead;
+        g_dead = img->next_dead;
+        image_free(img);
+    }
+}
+
+/* Our submitted work has finished (a wait or a status query said so). */
+static void fence_done(void) {
+    if (g_busy_said) {
+        g_busy_said = 0;
+        droiddeck_log("gpu", "the work a wait gave up on has finished: copies and frames resume");
+    }
+    g_fence_busy = 0;
+    reap_dead();
+}
+
+/* 0 = nothing of ours in flight, the shared fence and command buffer are free; -1 = still running (this
+ * use is skipped) or the device is lost. Never waits. */
+static int gpu_settled(const char *who) {
+    if (!g_fence_busy) return 0;
+    VkResult r = g_vk.GetFenceStatus(g_dev, g_fence);
+    if (r == VK_SUCCESS) { fence_done(); return 0; }
+    if (r == VK_ERROR_DEVICE_LOST) device_lost(who);
+    return -1;
+}
+
+/* gpu_settled() for a path about to record into slot 0: a use skipped is counted for the perf line. */
+static int gpu_gate(const char *who) {
+    if (gpu_settled(who) == 0) return 0;
+    if (g_dev_state == 1) g_perf.gpu_busy_skips++;
+    return -1;
+}
+
+int vkp_gpu_ready(void) {
+    if (g_dev_state != 1) return g_dev_state == 0; /* not up yet: the path brings it up itself */
+    return gpu_gate("gpu check") == 0;
+}
+
+/* Wait for the work just submitted with g_fence. A bounded wait that runs out leaves g_fence_busy set
+ * (gpu_settled takes it from there); anything else clears it. */
+static VkResult fence_wait(uint64_t timeout, const char *who) {
+    VkResult r = timed_wait(g_fence, timeout);
+    if (r == VK_SUCCESS) {
+        fence_done();
+    } else if (r == VK_TIMEOUT) {
+        g_perf.gpu_wait_timeouts++;
+        if (!g_busy_said) {
+            g_busy_said = 1;
+            droiddeck_log("gpu", "%s: the GPU has not finished after %llu ms; its buffers are left alone and "
+                       "copies and frames are skipped until it has", who, (unsigned long long)(timeout / 1000000ULL));
+        }
+    }
+    return r;
+}
+
+/* vkQueueSubmit with g_fence: from a successful submit on, the fence is in flight until a wait or a
+ * status query sees it signalled. */
+static VkResult submit_fenced(uint32_t count, const VkSubmitInfo *si) {
+    VkResult r = g_vk.QueueSubmit(g_queue, count, si, g_fence);
+    if (r == VK_SUCCESS) g_fence_busy = 1;
     return r;
 }
 
@@ -842,8 +922,7 @@ static void init_black_image(void) {
     g_vk.EndCommandBuffer(cmd);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
     g_vk.ResetFences(g_dev, 1, &g_fence);
-    if (g_vk.QueueSubmit(g_queue, 1, &si, g_fence) == VK_SUCCESS &&
-        g_vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, 1000000000ULL) == VK_SUCCESS)
+    if (submit_fenced(1, &si) == VK_SUCCESS && fence_wait(1000000000ULL, "letterbox image") == VK_SUCCESS)
         g_black_state = 1;
     else
         droiddeck_log("gpu", "letterbox black image unavailable: the whole output is cleared every copy-path frame");
@@ -1098,8 +1177,7 @@ void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
 int vkp_image_width(const struct vkp_image *img) { return img ? img->w : 0; }
 int vkp_image_height(const struct vkp_image *img) { return img ? img->h : 0; }
 
-void vkp_image_destroy(struct vkp_image *img) {
-    if (!img) return;
+static void image_free(struct vkp_image *img) {
     if (g_dev) {
         blendp_forget_image(img->image);
         if (img->map) g_vk.UnmapMemory(g_dev, img->mem);
@@ -1107,6 +1185,19 @@ void vkp_image_destroy(struct vkp_image *img) {
         if (img->mem) g_vk.FreeMemory(g_dev, img->mem, NULL);
     }
     free(img);
+}
+
+void vkp_image_destroy(struct vkp_image *img) {
+    if (!img) return;
+    /* Work a bounded wait gave up on may still read or write it (see g_fence_busy): freed when that
+     * work has finished. A lost device runs nothing any more, so everything goes at once there. */
+    if (g_dev && g_dev_state == 1 && gpu_settled("image destroy") != 0 && g_dev_state == 1) {
+        img->next_dead = g_dead;
+        g_dead = img;
+        g_perf.deferred_destroys++;
+        return;
+    }
+    image_free(img);
 }
 
 /* Map a draw into swapchain pixels through the scale mode, clipping the destination to the
@@ -1304,6 +1395,8 @@ static void device_lost(const char *where) {
     vkp_framegen_device_lost();
     droiddeck_log("error", "GPU device lost (VK_ERROR_DEVICE_LOST in %s): the compositor has stopped presenting; "
                "restart the session", where);
+    g_fence_busy = 0; /* nothing runs on a lost device: what waited for its work can go */
+    reap_dead();
     for (uint32_t i = 0; i < g_nimg; i++) blendp_forget_image(g_images[i]);
     if (g_swapchain) g_vk.DestroySwapchainKHR(g_dev, g_swapchain, NULL);
     g_swapchain = VK_NULL_HANDLE;
@@ -1534,6 +1627,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     check_surface_changed(); /* a rotation or a fold the rebind did not cover: rebuild at the new size */
     if (g_dev_state == -2) return -1;
     if (dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0) return -1;
+    if (gpu_gate("frame") != 0) return -1; /* a layer copy that timed out is still on the GPU */
 
     /* Frame generation queues several presents per scene frame and needs swapchain images for
      * them: rebuild when that changes (armed, disarmed, another multiplier). */
@@ -1778,7 +1872,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_acqs[k], .pWaitDstStageMask = &wait, .commandBufferCount = 1,
                            .pCommandBuffers = &g_cmds[k], .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rnds[k]};
-        VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, last ? g_fence : VK_NULL_HANDLE);
+        VkResult qr = last ? submit_fenced(1, &si) : g_vk.QueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE);
         if (qr != VK_SUCCESS) {
             if (qr == VK_ERROR_DEVICE_LOST) device_lost("submit");
             else LOGE("present: submit %d/%d failed (%d)", k + 1, presents, (int)qr);
@@ -1800,9 +1894,9 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         /* Ended early: an empty submit carrying the fence is ordered after everything queued
          * above, so the wait below still means "this frame's work is done". */
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
+        submit_fenced(1, &si);
     }
-    VkResult fr = timed_wait(g_fence, UINT64_MAX);
+    VkResult fr = fence_wait(UINT64_MAX, "frame");
     if (fg) vkp_framegen_presented(presented_gen);
     if (fr == VK_ERROR_DEVICE_LOST || pr == VK_ERROR_DEVICE_LOST) { device_lost("present"); return -1; }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR) {
@@ -1903,7 +1997,7 @@ int vkp_map_draw(const struct vkp_draw *d, int out[8]) {
  * owned by the "foreign" queue family (the game's driver / the display) between our uses, so each
  * use acquires them and the destination is released back for the display to read. */
 int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
-    if (!src || !dst || !dst->blit_dst || g_dev_state == -2 || dev_init() != 0) {
+    if (!src || !dst || !dst->blit_dst || g_dev_state == -2 || dev_init() != 0 || gpu_gate("layer blit") != 0) {
         if (wait_fd >= 0) close(wait_fd);
         return -1;
     }
@@ -1956,13 +2050,13 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
                        .waitSemaphoreCount = gpu_wait ? 1u : 0u, .pWaitSemaphores = gpu_wait ? &g_wait_sem : NULL,
                        .pWaitDstStageMask = gpu_wait ? &wait_stage : NULL};
     g_vk.ResetFences(g_dev, 1, &g_fence);
-    VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
+    VkResult qr = submit_fenced(1, &si);
     if (qr != VK_SUCCESS) {
         if (qr == VK_ERROR_DEVICE_LOST) device_lost("layer blit");
         else LOGE("layer: blit submit failed (%d)", (int)qr);
         return -1;
     }
-    VkResult fr = timed_wait(g_fence, 1000000000ULL);
+    VkResult fr = fence_wait(1000000000ULL, "layer blit");
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("layer blit"); return -1; }
     if (fr != VK_SUCCESS) { LOGE("layer: blit fence wait -> %s", vk_result_name(fr)); return -1; }
     return 0;
@@ -1977,7 +2071,7 @@ static struct vkp_image *g_rb;  /* the readback image, kept for the next shape *
 
 int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
     if (!src || !out || src->w <= 0 || src->h <= 0 || src->w * src->h > max_px ||
-        g_dev_state == -2 || dev_init() != 0)
+        g_dev_state == -2 || dev_init() != 0 || gpu_gate("cursor readback") != 0)
         return -1;
     if (g_rb && (g_rb->w != src->w || g_rb->h != src->h)) { vkp_image_destroy(g_rb); g_rb = NULL; }
     if (!g_rb) {
@@ -2052,12 +2146,12 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
     g_vk.EndCommandBuffer(cmd);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
     g_vk.ResetFences(g_dev, 1, &g_fence);
-    VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
+    VkResult qr = submit_fenced(1, &si);
     if (qr != VK_SUCCESS) {
         if (qr == VK_ERROR_DEVICE_LOST) device_lost("cursor readback");
         return -1;
     }
-    VkResult fr = timed_wait(g_fence, 1000000000ULL);
+    VkResult fr = fence_wait(1000000000ULL, "cursor readback");
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("cursor readback"); return -1; }
     if (fr != VK_SUCCESS) return -1;
     for (int y = 0; y < src->h; y++)
@@ -2115,6 +2209,7 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
                            const struct vkp_hdr_frame *hf, int *rw, int *rh) {
     if (g_pass.active) vkp_pass_abort();
     if (g_dev_state == -2 || dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0) return -1;
+    if (gpu_gate("layer pass") != 0) return -1; /* the scene image and slot 0 may still be in use */
     check_surface_changed(); /* as in render_impl: the effects pass maps onto the output's size */
     if (!g_swapchain && swap_init() != 0) return -1; /* the mapping is in output pixels */
     update_map(scene_w, scene_h);
@@ -2252,13 +2347,13 @@ int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
                        .waitSemaphoreCount = gpu_wait ? 1u : 0u, .pWaitSemaphores = gpu_wait ? &g_wait_sem : NULL,
                        .pWaitDstStageMask = gpu_wait ? &wait_stage : NULL};
     g_vk.ResetFences(g_dev, 1, &g_fence);
-    VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
+    VkResult qr = submit_fenced(1, &si);
     if (qr != VK_SUCCESS) {
         if (qr == VK_ERROR_DEVICE_LOST) device_lost("layer pass");
         else LOGE("layer: effects pass submit failed (%d)", (int)qr);
         return -1;
     }
-    VkResult fr = timed_wait(g_fence, 1000000000ULL);
+    VkResult fr = fence_wait(1000000000ULL, "layer pass");
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("layer pass"); return -1; }
     if (fr != VK_SUCCESS) { LOGE("layer: effects pass fence wait -> %s", vk_result_name(fr)); return -1; }
     return 0;

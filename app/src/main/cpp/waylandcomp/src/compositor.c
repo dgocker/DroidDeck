@@ -3398,11 +3398,12 @@ static int on_stats_timer(void *data) {
         vkp_perf_take(&vp);
         const unsigned drops = sc_layer_drops_take();
 #define PERF_MS(sum, n) ((n) ? (double)(sum) / 1e6 / (double)(n) : 0.0)
-        if (g_perf.scenes || vp.presents || g_perf.releases || drops)
+        if (g_perf.scenes || vp.presents || g_perf.releases || drops || vp.gpu_wait_timeouts || vp.gpu_busy_skips)
             droiddeck_log("perf", "last 10 s: %u ticks, %u scenes, %u on screen (copy %u, zero-copy %u, layer copy %u) | "
                        "render_scene %.2f/%.2f ms | base %u black kept, %u presented | acquire %.2f/%.2f ms | "
                        "present %.2f/%.2f ms (%u) | fence wait %.2f/%.2f ms (%u, %u GPU release waits) | "
-                       "release %.2f/%.2f ms (%u, %u held) | %u pool drops",
+                       "release %.2f/%.2f ms (%u, %u held) | %u pool drops | "
+                       "GPU waits timed out %u, uses skipped %u, destroys deferred %u",
                        g_perf.ticks, g_perf.scenes, g_stat_frames, g_perf.copy_scenes, zero_copy, layer_frames,
                        PERF_MS(g_perf.scene_ns, g_perf.scenes), (double)g_perf.scene_max_ns / 1e6,
                        vp.base_kept, vp.base_presents,
@@ -3410,7 +3411,8 @@ static int on_stats_timer(void *data) {
                        PERF_MS(vp.present_ns, vp.presents), (double)vp.present_max_ns / 1e6, vp.presents,
                        PERF_MS(vp.wait_ns, vp.waits), (double)vp.wait_max_ns / 1e6, vp.waits, vp.gpu_release_waits,
                        PERF_MS(g_perf.release_ns, g_perf.releases), (double)g_perf.release_max_ns / 1e6,
-                       g_perf.releases, g_perf.releases_held, drops);
+                       g_perf.releases, g_perf.releases_held, drops,
+                       vp.gpu_wait_timeouts, vp.gpu_busy_skips, vp.deferred_destroys);
 #undef PERF_MS
         memset(&g_perf, 0, sizeof(g_perf));
     }

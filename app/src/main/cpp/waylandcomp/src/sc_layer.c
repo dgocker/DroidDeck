@@ -883,6 +883,8 @@ int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const stru
     int g = layer_geometry(sw, sh, scene_w, scene_h, r);
     if (g < 0) return -1;
     if (g == 0) { sc_layer_hide(); return 0; } /* nothing of it is on screen */
+    /* Asked before a slot is taken: the slot's release fence must stay with it if the copy cannot run. */
+    if (!vkp_gpu_ready()) return -1;
 
     int wait_fd;
     int idx = take_free_slot(l, sw, sh, AHB_RGBA8, &wait_fd);
@@ -1046,6 +1048,7 @@ int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int transl
     if (ensure_sc(l) != 0) return -1;
     int sw = vkp_image_width(src), sh = vkp_image_height(src);
     if (sw <= 0 || sh <= 0) return -1;
+    if (!vkp_gpu_ready()) return -1; /* as in sc_layer_present: before a slot is taken */
     int wait_fd;
     int idx = take_free_slot(l, sw, sh, AHB_RGBA8, &wait_fd);
     if (idx < 0) { log_drop(l); return 0; }

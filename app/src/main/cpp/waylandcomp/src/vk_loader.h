@@ -27,7 +27,7 @@
     X(BindImageMemory) X(DestroyImage) X(FreeMemory) X(AcquireNextImageKHR) \
     X(ResetCommandBuffer) X(BeginCommandBuffer) X(CmdPipelineBarrier) X(CmdBlitImage) \
     X(EndCommandBuffer) X(ResetFences) X(QueueSubmit) X(QueuePresentKHR) X(WaitForFences) \
-    X(QueueWaitIdle) X(GetMemoryFdPropertiesKHR) \
+    X(GetFenceStatus) X(QueueWaitIdle) X(GetMemoryFdPropertiesKHR) \
     X(GetImageSubresourceLayout) X(MapMemory) X(UnmapMemory) X(CmdClearColorImage) \
     /* screen-effect chain (effects_chain.c): graphics pipelines over full-screen quads */ \
     X(CreateShaderModule) X(DestroyShaderModule) X(CreatePipelineLayout) X(DestroyPipelineLayout) \

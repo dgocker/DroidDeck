@@ -114,8 +114,15 @@ struct vkp_perf {
     unsigned base_presents;               /* black frames presented under the display layers */
     unsigned base_kept;                   /* layer frames that kept the black frame already there */
     unsigned gpu_release_waits;           /* layer-buffer release fences waited for on the GPU */
+    unsigned gpu_wait_timeouts;           /* a bounded wait gave up with our work still on the GPU */
+    unsigned gpu_busy_skips;              /* uses skipped because that work had not finished yet */
+    unsigned deferred_destroys;           /* images freed only once that work had finished */
 };
 void vkp_perf_take(struct vkp_perf *out);
+/* 1 when nothing the compositor submitted is still running on the GPU, so the next copy, pass or frame
+ * may be recorded; 0 while work a bounded wait gave up on is still in flight (or the device is lost).
+ * Never waits. Compositor thread. */
+int vkp_gpu_ready(void);
 /* 1 when a release fence (sync_file) can be handed to the GPU as a wait (VK_KHR_external_semaphore_fd):
  * the layer pool then reuses a buffer the display is still reading without blocking on the CPU. */
 int vkp_can_wait_sync_fd(void);
