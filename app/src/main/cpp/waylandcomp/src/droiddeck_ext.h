@@ -11,6 +11,8 @@
 #include <wayland-server.h>
 
 void droiddeck_log(const char *tag, const char *fmt, ...);
+/* Any thread: the session log goes on in [path] (a new session under a running compositor). */
+void droiddeck_log_reopen(const char *path);
 
 /* ---- compositor.c → modules */
 void droiddeck_ext_init(struct wl_display *display);           /* creates the globals + host queue */

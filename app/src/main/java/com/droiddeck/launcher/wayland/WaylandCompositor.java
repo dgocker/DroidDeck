@@ -301,6 +301,10 @@ public final class WaylandCompositor {
         return sessionLogFile;
     }
 
+    /** Points a running compositor's log at [path] from its next line on: a session after the first
+     *  in this process gets its own file. Before the compositor starts, BL_WAYLAND_LOG does this. */
+    public static native void nativeSetSessionLog(String path);
+
     /** Write one line into the compositor's session log (Download/Wayland-logs) under the "display"
      *  area, from Java. Used for facts the platform knows and the native side does not - the panel's
      *  HDR capability, which lives behind android.view.Display. Safe before the compositor thread is

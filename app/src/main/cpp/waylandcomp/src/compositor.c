@@ -98,6 +98,24 @@ void droiddeck_log(const char *tag, const char *fmt, ...) {
     pthread_mutex_unlock(&g_log_lock);
 }
 
+static void write_log_header(FILE *f, const char *path) {
+    char stamp[32];
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(f,
+            "DroidDeck Wayland session\n"
+            "=========================\n"
+            "Started   %s\n"
+            "Display   Wayland: programs draw through the DroidDeck compositor.\n"
+            "          gamescope and the desktop start their own Xwayland for X11 programs.\n"
+            "Log       %s\n\n"
+            "Time          Area      Event\n"
+            "------------  --------  -----------------------------------------------------\n",
+            stamp, path);
+}
+
 static void open_session_log(void) {
     char path[256], stamp[32];
     time_t now = time(NULL);
@@ -122,17 +140,7 @@ static void open_session_log(void) {
         return;
     }
     setvbuf(f, NULL, _IOLBF, 0);
-    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
-    fprintf(f,
-            "DroidDeck Wayland session\n"
-            "=========================\n"
-            "Started   %s\n"
-            "Display   Wayland: programs draw through the DroidDeck compositor.\n"
-            "          gamescope and the desktop start their own Xwayland for X11 programs.\n"
-            "Log       %s\n\n"
-            "Time          Area      Event\n"
-            "------------  --------  -----------------------------------------------------\n",
-            stamp, path);
+    write_log_header(f, path);
     /* Publish the file and flush anything logged before it existed, in one critical section, so a
      * line from another thread can never land ahead of the header or be dropped between the two. */
     pthread_mutex_lock(&g_log_lock);
@@ -140,6 +148,27 @@ static void open_session_log(void) {
     g_prelog_n = 0;
     g_log = f;
     pthread_mutex_unlock(&g_log_lock);
+    WLOGI("session log: %s", path);
+}
+
+/* A session after the first in this app process: the compositor lives as long as the process and
+ * opened its log for the first session, so without this every later session's lines would go on
+ * into the first session's folder and the new one would get none. From the next line on they go to
+ * [path]. Any thread; the swap is under the log lock, so no line is torn or lost between files. */
+void droiddeck_log_reopen(const char *path) {
+    if (!path || !*path) return;
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        WLOGE("can't open session log %s: %s", path, strerror(errno));
+        return;
+    }
+    setvbuf(f, NULL, _IOLBF, 0);
+    write_log_header(f, path);
+    pthread_mutex_lock(&g_log_lock);
+    FILE *old = g_log;
+    g_log = f;
+    pthread_mutex_unlock(&g_log_lock);
+    if (old) fclose(old);
     WLOGI("session log: %s", path);
 }
 

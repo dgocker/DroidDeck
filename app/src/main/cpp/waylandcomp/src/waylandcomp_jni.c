@@ -718,6 +718,17 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCounterFrequency(JNI
 #endif
 }
 
+/* A new session's log file for a compositor already running (see droiddeck_log_reopen). */
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetSessionLog(JNIEnv *env, jclass clazz, jstring path) {
+    (void)clazz;
+    if (!path) return;
+    const char *p = (*env)->GetStringUTFChars(env, path, NULL);
+    if (!p) return;
+    droiddeck_log_reopen(p);
+    (*env)->ReleaseStringUTFChars(env, path, p);
+}
+
 #ifndef PR_SVE_GET_VL
 #define PR_SVE_GET_VL 51
 #endif

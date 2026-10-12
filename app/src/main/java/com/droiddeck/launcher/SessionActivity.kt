@@ -1240,9 +1240,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         WaylandCompositor.nativeSetUpscaler(SessionPrefs.upscaler(this))
         WaylandCompositor.nativeSetUpscaleSharpness(SessionPrefs.upscaleSharpness(this))
         SessionPrefs.screenEffects(this).push(SessionPrefs.upscaler(this))
-        // The session's folder, claimed here because the compositor starts before the service and
-        // opens its log once. The compositor reads the path from its environment; setting it after
-        // it has started changes nothing, which is why the service copies the file in at teardown.
+        // The session's folder, claimed here because the compositor starts before the service. A
+        // compositor that is not up yet reads the path from its environment when it starts; one
+        // still running from an earlier session in this process is told to switch files, or this
+        // session's lines would go on into that session's folder and this one would get none.
         if (!SessionState.running) {
             val waylandLog = File(SessionPaths.beginOrCurrent(this), "wayland.log")
             WaylandCompositor.setSessionLogFile(waylandLog)
@@ -1251,6 +1252,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             } catch (e: Exception) {
                 Log.w(TAG, "could not point the compositor's log at $waylandLog", e)
             }
+            if (CompositorHost.isStarted) WaylandCompositor.nativeSetSessionLog(waylandLog.path)
         }
         // HDR10: the gate is decided once, when the compositor starts (it lives for the whole app
         // process), from the panel's own word and the mode's setting. Zero-copy presentation is
