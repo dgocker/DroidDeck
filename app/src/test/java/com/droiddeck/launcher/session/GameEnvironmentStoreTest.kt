@@ -154,8 +154,18 @@ class GameEnvironmentStoreTest {
         assertFalse(saved.games.containsKey("42"))
     }
 
-    @Test fun unchosenFexPresetPublishesPerformanceTso() {
+    @Test fun unchosenFexPresetLeavesFexToProton() {
+        // No FEX_* variable: the Config.json Proton ships and Steam's per-game settings decide, as they
+        // sit below FEX's environment layer.
         GameEnvironmentStore.save(context, GameEnvironment.Config())
+        val shared = JSONObject(guest.readText()).getJSONObject("shared")
+        assertEquals("", SessionPrefs.fexPreset(context))
+        assertTrue(com.droiddeck.launcher.core.FexPreset.environmentKeys.none { shared.has(it) })
+    }
+
+    @Test fun aChosenPerformanceTsoPresetStillPublishesItsVariables() {
+        GameEnvironmentStore.save(context, GameEnvironment.Config())
+        SessionPrefs.setFexPreset(context, "PERFORMANCE_TSO")
         val shared = JSONObject(guest.readText()).getJSONObject("shared")
         assertEquals("1", shared.getString("FEX_TSOENABLED"))
         assertEquals("0", shared.getString("FEX_HALFBARRIERTSOENABLED"))

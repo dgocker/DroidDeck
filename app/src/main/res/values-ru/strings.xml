@@ -91,7 +91,7 @@
     <string name="fex_next_launch">Вступит в силу при следующем запуске игры.</string>
     <string name="game_settings_title">Игры</string>
     <string name="fex_default_label">FEX по умолчанию</string>
-    <string name="fex_default_detail">Настройки FEX по умолчанию.</string>
+    <string name="fex_default_detail">Без переменных FEX: настройки FEX из Proton и пер-игровые настройки Steam и Proton.</string>
     <string name="fex_stability_label">Стабильность</string>
     <string name="fex_stability_detail">Самые безопасные и медленные настройки.</string>
     <string name="fex_compatibility_label">Совместимость</string>

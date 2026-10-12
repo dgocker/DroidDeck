@@ -93,7 +93,7 @@
     <string name="fex_next_launch">Applies on the next game launch.</string>
     <string name="game_settings_title">Games</string>
     <string name="fex_default_label">FEX defaults</string>
-    <string name="fex_default_detail">Uses FEX defaults.</string>
+    <string name="fex_default_detail">No FEX variables: Proton\'s own FEX settings and the per-game ones Steam and Proton add.</string>
     <string name="fex_stability_label">Stability</string>
     <string name="fex_stability_detail">Safest, slowest settings.</string>
     <string name="fex_compatibility_label">Compatibility</string>

@@ -564,14 +564,20 @@ object SessionPrefs {
     }
 
     /**
-     * The FEXCore preset for the games the client launches (core/FexPreset ids); "" = FEX's defaults.
-     * Performance + TSO unless chosen, WinNative's default: FEX's own defaults keep half-barrier TSO
-     * and full-precision x87, which cost every x86 game time; a game that needs them can still be
-     * given another preset.
+     * The FEXCore preset for the games the client launches (core/FexPreset ids); "" = no FEX_*
+     * variables, so FEX runs with the settings it is given: for a Proton game the Config.json Proton
+     * ships (TSO with half-barriers for unaligned accesses, reduced-precision x87, multiblock) and the
+     * per-game settings Steam and Proton add on top.
+     *
+     * That is the default. It was Performance + TSO (WinNative's default), whose variables sit above
+     * every other FEX layer: it turned half-barrier TSO off for every game - an unaligned access then
+     * gets backpatched to a plain load or store with no ordering at all, for good, at that site - and
+     * it replaced the TSO, multiblock and x87 settings Steam and Proton give single games. A preset
+     * chosen here or for one game still applies as before; the choice of a user who picked one is kept.
      */
     fun fexPreset(context: Context): String = prefs(context).getString("fexPreset", DEFAULT_FEX_PRESET) ?: DEFAULT_FEX_PRESET
 
-    private const val DEFAULT_FEX_PRESET = "PERFORMANCE_TSO"
+    private const val DEFAULT_FEX_PRESET = ""
 
     /**
      * Force SSBS for Proton games: Wine resumes threads from a Windows CONTEXT that never carries
