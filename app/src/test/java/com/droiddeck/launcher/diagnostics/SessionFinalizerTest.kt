@@ -257,7 +257,7 @@ class SessionFinalizerTest {
 
     @Test
     fun fexAndCpuSamplesComeInWithMillisecondsWhenTheTimerIsKnown() {
-        val launch = launcher.start(output = "x\n")
+        val launch = launcher.start(output = "x\n", extra = mapOf("cpu_ids" to mapOf("midr_el1" to listOf("0x00000000510f0020"), "error" to null)))
         File(store.inbox, "${launch.id}.fex.csv").writeText(
             "t_s,pid,app_type,fex_version,threads,jit_ticks,signal_ticks,sigbus\n" +
                 "10.0,500,arm64ec,FEX-2609,12,19200000,96000,7\n20.0,500,arm64ec,FEX-2609,12,19392000,96000,9\n")
@@ -272,7 +272,10 @@ class SessionFinalizerTest {
         assertEquals("10.0,3300000,45000,cpu-0", File(s.dir, "cpu.csv").readLines()[1])
         assertFalse(File(store.inbox, "${launch.id}.fex.csv").exists())
         assertFalse(missing(s).containsKey("fex_stats.csv"))
-        assertTrue(JSONObject(File(s.dir, "manifest.json").readText()).toString().contains("every 5 s"))
+        val manifest = JSONObject(File(s.dir, "manifest.json").readText())
+        assertTrue(manifest.toString().contains("every 5 s"))
+        // What the guest could read of the CPU's identity: Wine hands it to FEX for its errata.
+        assertEquals("0x00000000510f0020", manifest.getJSONObject("launch").getJSONObject("guest_cpu_ids").getJSONArray("midr_el1").getString(0))
     }
 
     @Test

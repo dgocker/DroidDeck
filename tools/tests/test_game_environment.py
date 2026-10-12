@@ -296,6 +296,8 @@ class GameEnvironmentTest(unittest.TestCase):
             info = MODULE["fex_build"](str(root / "proton"))
             self.assertEqual(info["libarm64ecfex.dll"], "FEX-2609-137-g0df84d3")
             self.assertEqual(info["libwow64fex.dll"], "present, no version string")
+            # The exact module, whichever package put it there.
+            self.assertEqual(info["sha256"]["libwow64fex.dll"], hashlib.sha256(b"MZ no version here").hexdigest())
             self.assertEqual(info["Config.json"], {"TSOEnabled": "1", "HalfBarrierTSOEnabled": "1"})
             self.assertEqual(MODULE["fex_build"](str(root / "elsewhere/proton")), {})
 

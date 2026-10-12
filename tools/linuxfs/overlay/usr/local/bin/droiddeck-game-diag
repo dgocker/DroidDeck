@@ -373,6 +373,24 @@ def in_tree(pid, root, cache):
     return answer
 
 
+def cpu_ids(sys_root="/sys"):
+    """Each distinct MIDR_EL1 the kernel shows here, or why one could not be read: Wine hands it to FEX,
+    which recognises the CPU by it (Oryon's RNDRRS erratum, the LDAPUR errata of Cortex cores)."""
+    base = os.path.join(sys_root, "devices/system/cpu")
+    values, error = set(), None
+    try:
+        names = sorted(n for n in os.listdir(base) if re.fullmatch(r"cpu\d+", n))
+    except OSError as e:
+        return {"midr_el1": [], "error": "%s: %s" % (base, e.strerror or e)}
+    for name in names:
+        try:
+            with open(os.path.join(base, name, "regs/identification/midr_el1"), encoding="utf-8") as f:
+                values.add(f.read().strip())
+        except OSError as e:
+            error = error or "%s: %s" % (name, e.strerror or e)
+    return {"midr_el1": sorted(values), "error": error}
+
+
 def read_int(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -612,6 +630,7 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
             "program": os.path.basename(used[0][0]) if used else os.path.basename(command[0]),
             "stock_fallback": bool(used and used[1]),
             "session_log_offset": file_size(env.get("BL_LOG")),
+            "cpu_ids": cpu_ids(),
             "output_file": os.path.basename(tee.path) if tee and tee.out is not None else None,
         })
         write_record(base + ".start.json", start)

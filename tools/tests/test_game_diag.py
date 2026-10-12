@@ -256,6 +256,21 @@ def fex_stats(threads, version=b"FEX-2609-137-g0df84d3", app_type=2):
     return bytes(data)
 
 
+class CpuIdsTest(unittest.TestCase):
+    def test_distinct_midrs_and_why_one_was_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cpus = Path(tmp) / "devices/system/cpu"
+            for n, midr in ((0, "0x00000000510f0020"), (1, "0x00000000510f0020"), (2, "0x00000000510f0030")):
+                (cpus / ("cpu%d" % n) / "regs/identification").mkdir(parents=True)
+                (cpus / ("cpu%d" % n) / "regs/identification/midr_el1").write_text(midr + "\n")
+            (cpus / "cpu3").mkdir()
+            (cpus / "cpufreq").mkdir()
+            ids = DIAG["cpu_ids"](tmp)
+            self.assertEqual(ids["midr_el1"], ["0x00000000510f0020", "0x00000000510f0030"])
+            self.assertIn("cpu3", ids["error"])
+            self.assertEqual(DIAG["cpu_ids"](str(Path(tmp) / "none"))["midr_el1"], [])
+
+
 class SamplerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

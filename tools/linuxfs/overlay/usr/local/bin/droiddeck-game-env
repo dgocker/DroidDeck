@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import ast
+import hashlib
 import json
 import os
 import re
@@ -372,6 +373,7 @@ def fex_build(proton):
             continue
         versions = FEX_VERSION.findall(data)
         info[name] = max(versions, key=len).decode() if versions else "present, no version string"
+        info.setdefault("sha256", {})[name] = hashlib.sha256(data).hexdigest()
     try:
         info["Config.json"] = json.loads((files / "share/fex-emu/Config.json").read_text(encoding="utf-8")).get("Config")
     except (OSError, ValueError, AttributeError):
