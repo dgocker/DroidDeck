@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+import ast
 import json
 import os
 import re
@@ -281,6 +282,64 @@ def profile_line(app_id, env):
     return "droiddeck-game-env: graphics profile for app %s: %s" % (app_id, " ".join(values))
 
 
+# FEX settings Proton decides for a game. Steam's appinfo gives some titles their own TSO and multiblock
+# settings (STEAM_FEX_TSOENABLED, STEAM_FEX_MULTIBLOCK), the client's per-game compatibility option gives
+# the user's (STEAM_COMPAT_FEX_CONFIG), and Proton's own fex_application_profiles hold per-executable
+# fixes (The Witcher 3's setup launcher needs full x87 precision). Proton writes all of them into
+# FEX_APP_CONFIG, a layer FEX reads below its environment variables (FEXCore Config.cpp LoadOrder:
+# ... LAYER_USER_OVERRIDE, LAYER_ENVIRONMENT) - so a FEX_* variable from DroidDeck's general preset,
+# put into every game's environment, silently replaced each of them.
+STEAM_FEX_KEYS = {"STEAM_FEX_TSOENABLED": "FEX_TSOENABLED", "STEAM_FEX_MULTIBLOCK": "FEX_MULTIBLOCK"}
+FEX_PROFILES = re.compile(r"^fex_application_profiles\s*=\s*(\{.*?^\})", re.MULTILINE | re.DOTALL)
+
+
+def proton_fex_profiles(proton):
+    """Proton's fex_application_profiles from its `proton` script - read as a literal, never run - or {}."""
+    try:
+        with open(proton, encoding="utf-8", errors="replace") as f:
+            match = FEX_PROFILES.search(f.read())
+        value = ast.literal_eval(match.group(1)) if match else {}
+    except (OSError, ValueError, SyntaxError, MemoryError, RecursionError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def proton_fex_keys(env, proton, app_id):
+    """The FEX_* names Steam or Proton set for this game, and why."""
+    decided = {}
+    for steam, fex in STEAM_FEX_KEYS.items():
+        if env.get(steam, "") != "":
+            decided[fex] = "Steam's per-game %s=%s" % (steam, env[steam])
+    if env.get("STEAM_COMPAT_FEX_CONFIG"):
+        for fex in ("FEX_TSOENABLED", "FEX_MULTIBLOCK"):
+            decided[fex] = "the Steam compatibility option STEAM_COMPAT_FEX_CONFIG"
+    profiles = proton_fex_profiles(proton)
+    patterns = profiles.get(env.get("SteamGameId") or app_id) or profiles.get(app_id)
+    if isinstance(patterns, dict):
+        for pattern, settings in patterns.items():
+            if isinstance(settings, dict):
+                for name in settings:
+                    decided["FEX_" + str(name).upper()] = "Proton's profile for %s (%s)" % (pattern, name)
+    return decided
+
+
+def yield_to_proton(env, inherited, config, app_id, decided):
+    """FEX_* values from DroidDeck's general settings give way to what Steam or Proton set for this game;
+    a preset chosen for this game itself still wins. A value the session's own environment brought
+    (droiddeck-env) is put back as it was. Returns the names that gave way."""
+    shared = config.get("shared", {}) if isinstance(config, dict) else {}
+    game = config.get("games", {}).get(app_id, {}) if isinstance(config, dict) else {}
+    yielded = []
+    for name in sorted(decided):
+        if name in shared and name not in game:
+            if name in inherited:
+                env[name] = inherited[name]
+            else:
+                env.pop(name, None)
+            yielded.append(name)
+    return yielded
+
+
 DIAG = "droiddeck-game-diag"
 
 
@@ -296,6 +355,28 @@ def load_diag():
 def game_key(app_id):
     """Where a game's diagnostics are kept: Steam's own ids, and the ids the client gives shortcuts."""
     return ("shortcut-" if int(app_id) >= 2**31 else "steam-") + app_id
+
+
+FEX_VERSION = re.compile(rb"FEX-\d{4}(?:\.\d+)?(?:-\d+-g[0-9a-f]{6,})?")
+
+
+def fex_build(proton):
+    """The FEX this Proton runs x86 code with: the version named in its ARM64EC module, and the Config.json
+    Proton ships beside it - what a launch's own FEX_* variables are layered over."""
+    files = Path(proton).resolve().parent / "files"
+    info = {}
+    for name in ("libarm64ecfex.dll", "libwow64fex.dll"):
+        try:
+            data = (files / "lib/wine/aarch64-windows" / name).read_bytes()
+        except OSError:
+            continue
+        versions = FEX_VERSION.findall(data)
+        info[name] = max(versions, key=len).decode() if versions else "present, no version string"
+    try:
+        info["Config.json"] = json.loads((files / "share/fex-emu/Config.json").read_text(encoding="utf-8")).get("Config")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return info
 
 
 def launch_meta(app_id, command, launch, env, diag):
@@ -318,6 +399,12 @@ def launch_meta(app_id, command, launch, env, diag):
         "sync": "stock" if launch[0] == command[0] else os.path.basename(launch[0]),
         "sync_env": sync,
         "graphics": profile_values(env),
+        "fex": {
+            "build": fex_build(command[0]),
+            "env": {k: v for k, v in sorted(env.items()) if k.startswith("FEX_")},
+            "steam": {k: v for k, v in sorted(env.items()) if k.startswith("STEAM_FEX_") or k == "STEAM_COMPAT_FEX_CONFIG"},
+            "decided_by_proton": proton_fex_keys(env, command[0], app_id),
+        },
     }
 
 
@@ -368,7 +455,11 @@ def main():
             with path.open(encoding="utf-8") as source:
                 config = json.load(source)
             if waiting:
+                inherited = env
                 env = apply_config(env, config, app_id, fixes)
+                decided = proton_fex_keys(inherited, command[0], app_id)
+                for name in yield_to_proton(env, inherited, config, app_id, decided):
+                    print("droiddeck-game-env: %s left to %s, not the general FEX preset" % (name, decided[name]), file=sys.stderr)
             else:
                 env = apply_config(env, sync_config(config, app_id), app_id)
         except FileNotFoundError:

@@ -219,6 +219,112 @@ class GameEnvironmentTest(unittest.TestCase):
             result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), "waitforexitandrun"], env={**env, "CUSTOM": "original"}, text=True, capture_output=True, check=True)
             self.assertEqual(json.loads(result.stdout)[0], "original")
 
+    # The table as Proton's `proton` script carries it (ValveSoftware/Proton experimental_11.0).
+    PROTON_PROFILES = (
+        'fex_application_profiles = {\n'
+        '    "292030" : { # The Witcher 3: Wild Hunt\n'
+        '        "setup*": {\n'
+        '            "X87ReducedPrecision": "0"\n'
+        '        }\n'
+        '    }\n'
+        '}\n'
+    )
+    PRESET = {"FEX_TSOENABLED": "1", "FEX_MULTIBLOCK": "1", "FEX_X87REDUCEDPRECISION": "1", "FEX_HALFBARRIERTSOENABLED": "0"}
+
+    def proton(self, tmp, profiles=True):
+        script = Path(tmp) / "proton"
+        script.write_text("#!/usr/bin/env python3\nimport os\n" + (self.PROTON_PROFILES if profiles else "") + "def main():\n    pass\n")
+        return str(script)
+
+    def test_proton_fex_profiles_are_read_never_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(MODULE["proton_fex_profiles"](self.proton(tmp)), {"292030": {"setup*": {"X87ReducedPrecision": "0"}}})
+            self.assertEqual(MODULE["proton_fex_profiles"](self.proton(tmp, profiles=False)), {})
+            evil = Path(tmp) / "evil"
+            evil.write_text("fex_application_profiles = {\n    '1': __import__('os').system('touch %s/ran')\n}\n" % tmp)
+            self.assertEqual(MODULE["proton_fex_profiles"](str(evil)), {})
+            self.assertFalse((Path(tmp) / "ran").exists())
+            self.assertEqual(MODULE["proton_fex_profiles"](str(Path(tmp) / "missing")), {})
+
+    def test_the_general_fex_preset_gives_way_to_what_steam_and_proton_set_per_game(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proton = self.proton(tmp)
+            config = {"version": 1, "shared": dict(self.PRESET), "games": {}}
+            # Nothing set for the game: the preset applies as before.
+            env = {"STEAM_COMPAT_DATA_PATH": "/compatdata/42"}
+            result = MODULE["apply_config"](env, config, "42")
+            decided = MODULE["proton_fex_keys"](env, proton, "42")
+            self.assertEqual(decided, {})
+            self.assertEqual(MODULE["yield_to_proton"](result, env, config, "42", decided), [])
+            self.assertEqual(result["FEX_TSOENABLED"], "1")
+            # Steam's appinfo values and Proton's own profile for The Witcher 3's launcher.
+            env = {"STEAM_COMPAT_DATA_PATH": "/compatdata/292030", "SteamGameId": "292030",
+                   "STEAM_FEX_TSOENABLED": "0", "STEAM_FEX_MULTIBLOCK": "0"}
+            result = MODULE["apply_config"](env, config, "292030")
+            decided = MODULE["proton_fex_keys"](env, proton, "292030")
+            self.assertEqual(sorted(decided), ["FEX_MULTIBLOCK", "FEX_TSOENABLED", "FEX_X87REDUCEDPRECISION"])
+            yielded = MODULE["yield_to_proton"](result, env, config, "292030", decided)
+            self.assertEqual(yielded, ["FEX_MULTIBLOCK", "FEX_TSOENABLED", "FEX_X87REDUCEDPRECISION"])
+            for name in yielded:
+                self.assertNotIn(name, result)
+            self.assertEqual(result["FEX_HALFBARRIERTSOENABLED"], "0")  # nothing per-game said otherwise
+            # The user's Steam compatibility option decides TSO and multiblock.
+            env = {"STEAM_COMPAT_DATA_PATH": "/compatdata/7", "STEAM_COMPAT_FEX_CONFIG": "TSOEnabled:0,Multiblock:1"}
+            self.assertEqual(sorted(MODULE["proton_fex_keys"](env, proton, "7")), ["FEX_MULTIBLOCK", "FEX_TSOENABLED"])
+
+    def test_a_preset_chosen_for_the_game_and_the_sessions_own_environment_still_win(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proton = self.proton(tmp)
+            config = {"version": 1, "shared": dict(self.PRESET), "games": {"292030": {"FEX_TSOENABLED": "1"}}}
+            env = {"STEAM_COMPAT_DATA_PATH": "/compatdata/292030", "STEAM_FEX_TSOENABLED": "0", "STEAM_FEX_MULTIBLOCK": "0",
+                   "FEX_MULTIBLOCK": "0"}
+            result = MODULE["apply_config"](env, config, "292030")
+            decided = MODULE["proton_fex_keys"](env, proton, "292030")
+            yielded = MODULE["yield_to_proton"](result, env, config, "292030", decided)
+            self.assertEqual(result["FEX_TSOENABLED"], "1")   # the game's own preset
+            self.assertEqual(result["FEX_MULTIBLOCK"], "0")   # put back as droiddeck-env gave it
+            self.assertNotIn("FEX_TSOENABLED", yielded)
+
+    def test_the_fex_build_a_proton_carries_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "files/lib/wine/aarch64-windows").mkdir(parents=True)
+            (root / "files/share/fex-emu").mkdir(parents=True)
+            (root / "files/lib/wine/aarch64-windows/libarm64ecfex.dll").write_bytes(b"MZ\0junk FEX-2609 more FEX-2609-137-g0df84d3\0")
+            (root / "files/lib/wine/aarch64-windows/libwow64fex.dll").write_bytes(b"MZ no version here")
+            (root / "files/share/fex-emu/Config.json").write_text('{"Config": {"TSOEnabled": "1", "HalfBarrierTSOEnabled": "1"}}')
+            info = MODULE["fex_build"](str(root / "proton"))
+            self.assertEqual(info["libarm64ecfex.dll"], "FEX-2609-137-g0df84d3")
+            self.assertEqual(info["libwow64fex.dll"], "present, no version string")
+            self.assertEqual(info["Config.json"], {"TSOEnabled": "1", "HalfBarrierTSOEnabled": "1"})
+            self.assertEqual(MODULE["fex_build"](str(root / "elsewhere/proton")), {})
+
+    def test_a_launch_says_which_fex_settings_it_left_to_proton(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / ".config/droiddeck/game-environment.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"version": 1, "shared": dict(self.PRESET)}))
+            probe = home / "fake-proton"
+            probe.write_text("#!/usr/bin/python3\nimport json, os\nprint(json.dumps({k: v for k, v in os.environ.items() if k.startswith('FEX_')}))\n"
+                             + self.PROTON_PROFILES)
+            probe.chmod(0o755)
+            env = {**os.environ, "HOME": tmp, "STEAM_COMPAT_DATA_PATH": "/compatdata/292030", "SteamGameId": "292030",
+                   "STEAM_FEX_TSOENABLED": "1"}
+            for name in list(env):
+                if name.startswith("FEX_") or name == "BL_DIAG_DIR":
+                    env.pop(name)
+            result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), "waitforexitandrun", "witcher3.exe"],
+                                    env=env, text=True, capture_output=True, check=True)
+            got = json.loads(result.stdout)
+            self.assertEqual(got, {"FEX_HALFBARRIERTSOENABLED": "0", "FEX_MULTIBLOCK": "1"})
+            self.assertIn("FEX_TSOENABLED left to Steam's per-game STEAM_FEX_TSOENABLED=1", result.stderr)
+            self.assertIn("FEX_X87REDUCEDPRECISION left to Proton's profile for setup* (X87ReducedPrecision)", result.stderr)
+            # Other verbs are not game launches and get no FEX preset either way.
+            result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), "run", "x.exe"],
+                                    env=env, text=True, capture_output=True, check=True)
+            self.assertNotIn("left to", result.stderr)
+
     def test_each_game_launch_names_its_graphics_profile(self):
         # The A/B record: a game whose profile removes the session's TU_DEBUG says so at launch, the
         # session's other games keep it, and probes and non-launch verbs say nothing.
