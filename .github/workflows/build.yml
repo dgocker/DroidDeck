@@ -150,6 +150,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-cleanup: on-success
+          # The action writes its cache on the default branch only; a manual run of another branch
+          # writes it too, so the next run of that branch starts warm. Pull requests only read.
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Resolve the runner's NDK
         run: |
@@ -181,9 +184,12 @@ jobs:
           echo "DROIDDECK_PR_NUMBER=${PR_NUMBER:-0}" >> "$GITHUB_ENV"
           echo "Build: \`$label\`" >> "$GITHUB_STEP_SUMMARY"
 
+      # The caches below are restored here and saved as soon as what they hold is built (the
+      # "Save ..." steps), not at the end of the job: a later failing step - the Gradle build, most
+      # often - then does not throw away the preloads, proot or the native objects.
       - name: Cache the preloads
         id: preloads
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: app/src/main/assets/linuxfs
           key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**', 'tools/linuxfs/debian-image.env') }}
@@ -357,7 +363,7 @@ jobs:
 
       - name: Cache PulseAudio 13.0 source
         id: pa-src
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: pa13
           key: pulseaudio-src-13.0
@@ -367,6 +373,12 @@ jobs:
           set -euo pipefail
           curl -fsSL -o pa.tar.gz https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v13.0.tar.gz
           mkdir -p pa13 && tar -xzf pa.tar.gz -C pa13 --strip-components=1 && rm pa.tar.gz
+      - name: Save PulseAudio 13.0 source
+        if: steps.pa-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pa13
+          key: pulseaudio-src-13.0
       # DirectAudio - the game driver (one set per Wine audio interface), the Android-side helper and
       # the Steam client's sinks - comes from a pinned release of The412Banner/directaudio, checksummed,
       # exactly like gamescope; nothing compiled for audio is kept in this repo.
@@ -389,7 +401,7 @@ jobs:
           rm -rf pa-bundle sink-out
       - name: Cache proot
         id: proot
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             app/src/main/jniLibs/arm64-v8a/libproot.so
@@ -407,6 +419,22 @@ jobs:
           set -euo pipefail
           bash tools/linuxfs/check-preloads.sh app/src/main/assets/linuxfs
 
+      # Only preloads that passed the check above are kept.
+      - name: Save the preloads
+        if: steps.preloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: app/src/main/assets/linuxfs
+          key: ${{ steps.preloads.outputs.cache-primary-key }}
+      - name: Save proot
+        if: steps.proot.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/src/main/jniLibs/arm64-v8a/libproot.so
+            app/src/main/jniLibs/arm64-v8a/libproot-loader.so
+          key: ${{ steps.proot.outputs.cache-primary-key }}
+
       # The store download engines (app/src/main/rust/stores) are Rust, built by Gradle's
       # buildRustStores task through cargo-ndk. rustup and cargo are on the runner image; the Android
       # target and cargo-ndk are added here. Cache = cargo registry + cargo-ndk + the crate's target
@@ -422,7 +450,8 @@ jobs:
           rustc -V; cargo -V
 
       - name: Cache cargo registry and the store engines' target
-        uses: actions/cache@v4
+        id: stores-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -441,7 +470,8 @@ jobs:
           cargo ndk --version
 
       - name: Cache the CMake build tree
-        uses: actions/cache@v4
+        id: cxx-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             app/.cxx
@@ -461,6 +491,28 @@ jobs:
           ./gradlew assembleRelease --console=plain -PndkVersion="$NDK_VERSION" 2>&1 | tee /tmp/build.log
           python3 tools/release/check_session_assets.py app/build/outputs/apk/release/app-release.apk
           python3 tools/release/runtime_inputs.py apk app/build/outputs/apk/release/app-release.apk
+
+      # Saved whether the build passed or not: objects a failed build already compiled are what the
+      # next run builds on (an exact-key hit is incremental too, cargo and ninja redo what is missing).
+      - name: Save cargo registry and the store engines' target
+        if: always() && steps.build.outcome != 'skipped' && steps.stores-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-ndk
+            app/src/main/rust/stores/target
+          key: ${{ steps.stores-cache.outputs.cache-primary-key }}
+      - name: Save the CMake build tree
+        if: always() && steps.build.outcome != 'skipped' && steps.cxx-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/.cxx
+            app/build/intermediates/cxx
+          key: ${{ steps.cxx-cache.outputs.cache-primary-key }}
 
       - name: Check the store engines' library
         # The exports Kotlin binds must be in the apk's libdroiddeckstores.so, or the stores fail on
