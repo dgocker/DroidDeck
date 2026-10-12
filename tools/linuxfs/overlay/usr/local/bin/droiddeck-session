@@ -177,11 +177,14 @@ export XDG_DATA_DIRS=$XDG_DATA_HOME/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/
 # program from the rail): the user's game cores when set (BL_GAME_CPUS), else every core but the
 # slowest cluster - Android is free to park an emulator's threads on the little cores, and those
 # are what compile shaders and recompile PPU/SPU code. BL_PIN_CORES=0 leaves the scheduler alone.
+# Only when at least four cores are left: a two-cluster SoC whose slower cluster is most of the
+# chip (2 + 6: Snapdragon 8 Elite, 8 Elite Gen 5, 8 Gen 5) has no little cores to avoid, and
+# leaving that cluster out would put the desktop and every emulator on two cores.
 program_cores() {
   [ "${BL_PIN_CORES:-1}" = 0 ] && return 0
   command -v taskset >/dev/null 2>&1 || return 0
   if [ -n "${BL_GAME_CPUS:-}" ]; then echo "$BL_GAME_CPUS"; return 0; fi
-  local f n max min= list=
+  local f n max min= list= kept=0
   for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
     max=$(cat "$f" 2>/dev/null) || continue
     [ -z "$min" ] || [ "$max" -lt "$min" ] && min=$max
@@ -190,8 +193,9 @@ program_cores() {
   for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
     max=$(cat "$f" 2>/dev/null) || continue
     n=${f#/sys/devices/system/cpu/cpu}; n=${n%%/*}
-    [ "$max" -gt "$min" ] && list="$list${list:+,}$n"
+    [ "$max" -gt "$min" ] && list="$list${list:+,}$n" && kept=$((kept + 1))
   done
+  [ "$kept" -ge 4 ] || return 0
   echo "$list"
 }
 
