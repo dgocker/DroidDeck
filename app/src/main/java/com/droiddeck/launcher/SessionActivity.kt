@@ -1268,7 +1268,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             SessionState.hdr = on
             if (on) {
                 try { android.system.Os.setenv("DROIDDECK_WAYLAND_HDR", "1", true) } catch (e: Exception) { Log.w(TAG, "DROIDDECK_WAYLAND_HDR", e) }
-                WaylandCompositor.nativeSetZeroCopy(true)
+                CompositorHost.setZeroCopy(true, "HDR session")
             }
             WaylandCompositor.nativeSetHdrRequest(
                 if (on) WaylandCompositor.HDR_MODE_ON else WaylandCompositor.HDR_MODE_OFF,
@@ -1277,6 +1277,12 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             )
             Log.i(TAG, "hdr: " + (if (on) "on" else if (wanted) "wanted but ${probe.reason}" else "off") + " · display ${probe.formats.ifEmpty { "SDR" }}")
         }
+        // Layer mode for this session (LayerMode): HDR keeps it on; for SDR only droiddeck-env turns it on.
+        val envLines = SessionService.envSwitchFile(this)?.takeIf { it.isFile }
+            ?.let { FileUtils.readString(it)?.lines() }.orEmpty()
+        val layer = com.droiddeck.launcher.session.LayerMode.choose(
+            SessionState.hdr, com.droiddeck.launcher.session.LayerMode.requested(envLines))
+        CompositorHost.setZeroCopy(layer.on, layer.reason)
         CompositorHost.startOrAttach(
             holder.surface, runtimeDir.path,
             driverId?.let { turnip.driverPath(it) }, driverId?.let { turnip.libraryName(it) },

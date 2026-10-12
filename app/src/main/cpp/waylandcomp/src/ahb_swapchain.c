@@ -372,7 +372,7 @@ void ahb_swapchain_set_mode(int on, int live) {
     on = on ? 1 : 0;
     g_zero_copy = on;
     if (!g_advertised) {
-        if (live) droiddeck_log("layer", "zero-copy switched %s from the drawer, but no display layer is available on this device: no change",
+        if (live) droiddeck_log("layer", "zero-copy switched %s while running, but no display layer is available on this device: no change",
                              on ? "on" : "off");
         return;
     }
@@ -390,14 +390,14 @@ void ahb_swapchain_set_mode(int on, int live) {
     memset(&g_last_chain, 0, sizeof(g_last_chain));
     g_announced = NULL;
     if (live)
-        droiddeck_log("layer", "zero-copy switched %s from the drawer: %d bound program%s told to rebuild their swapchains%s",
+        droiddeck_log("layer", "zero-copy switched %s while running: %d bound program%s told to rebuild their swapchains%s",
                    on ? "on" : "off", told, told == 1 ? "" : "s",
                    on ? "; frames go on the display layer once the new gralloc swapchain is up"
                       : "; gralloc frames still in flight stay on the layer (or take the copy path) until then");
     else
         droiddeck_log("layer", "zero-copy: %s at launch (%s)", on ? "on" : "off",
-                   on ? "DROIDDECK_WAYLAND_ZERO_COPY=1: games present their own gralloc buffers on the display layer"
-                      : "the drawer's Zero-copy presentation switch turns it on live");
+                   on ? "games present their own gralloc buffers on the display layer"
+                      : "DROIDDECK_WAYLAND_ZERO_COPY=1 in droiddeck-env turns it on for SDR sessions");
     if (live) wl_display_flush_clients(droiddeck_get_display());
     droiddeck_request_redraw();
 }

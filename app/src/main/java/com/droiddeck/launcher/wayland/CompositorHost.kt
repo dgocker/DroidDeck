@@ -57,6 +57,24 @@ object CompositorHost {
         return true
     }
 
+    /** What layer mode was last set to (null = never this process): native is told only on a change. */
+    @Volatile
+    private var zeroCopy: Boolean? = null
+
+    /**
+     * Layer mode on or off for the session about to start ([com.droiddeck.launcher.session.LayerMode]):
+     * before the compositor starts it is the launch default, afterwards a live switch the compositor
+     * thread applies before the session's programs connect. The reason goes to the session's
+     * wayland.log, so a report says which path frames took and why.
+     */
+    @Synchronized
+    fun setZeroCopy(on: Boolean, reason: String) {
+        if (zeroCopy == on) return
+        zeroCopy = on
+        WaylandCompositor.nativeSetZeroCopy(on)
+        WaylandCompositor.nativeLog("layer", "layer mode " + (if (on) "on" else "off") + ": " + reason)
+    }
+
     /**
      * The session's frame cap, on every attach: the compositor outlives sessions, and the next one
      * may have a different cap. The release pacer hands a game one buffer back per capped frame

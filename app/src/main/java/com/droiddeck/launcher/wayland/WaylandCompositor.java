@@ -245,8 +245,9 @@ public final class WaylandCompositor {
     public static native void nativeSetOutputRefreshRate(float hz);
 
     /** Show a single fullscreen window on its own Android layer (SurfaceControl) instead of blitting
-     *  it into the compositor's swapchain. DROIDDECK_WAYLAND_ZERO_COPY=1 in the container's environment
-     *  variables is the launch default; see waylandcomp/ZERO_COPY_SPIKE.md.
+     *  it into the compositor's swapchain. Set per session through CompositorHost.setZeroCopy: on for HDR,
+     *  and for SDR when droiddeck-env says DROIDDECK_WAYLAND_ZERO_COPY=1 (session/LayerMode); see
+     *  waylandcomp/ZERO_COPY_SPIKE.md.
      *
      *  Live and thread-safe: before the compositor starts this is the initial state, and afterwards
      *  the call is marshalled onto the compositor thread, which flips the state, tells every bound
