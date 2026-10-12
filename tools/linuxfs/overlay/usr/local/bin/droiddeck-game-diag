@@ -1,0 +1,479 @@
+#!/usr/bin/python3
+"""Game diagnostics for one launch: what started, and how it ended.
+
+droiddeck-game-env (Proton) and droiddeck-fex (Linux games) used to exec the game, so its exit went
+to the Steam client's reaper and nowhere else: a game that crashed and one that was quit looked the
+same from the app. With the app's diagnostics directory in BL_DIAG_DIR, a real game launch
+(waitforexitandrun) runs through run() instead:
+
+  - the launch command is started as a child and waited on, never exec'd. Signals the launcher
+    gets from outside (the client's Stop, the session closing) are passed on to it, and the status
+    the client sees is the game's own (128 + N for a signal, as a shell reports it);
+  - <id>.start.json and <id>.exit.json are written beside each other in BL_DIAG_DIR, each through a
+    rename, so the app never reads half a record. The exit record has the raw wait status: exit
+    code, signal, core dump flag, the signals that were passed on, and whether the start failed;
+  - the game's stderr (Proton, Wine, DXVK/VKD3D-Proton, FEX, Mesa all write there) is copied to
+    <id>.out.log up to BL_DIAG_OUTPUT_CAP bytes while still going where it went before (the session
+    log). The copy is made by a thread of this process, in 64 KiB reads; the game itself never
+    writes to a file for it.
+
+Nothing here may keep a game from starting: a record that cannot be written is skipped, and with
+DROIDDECK_DIAGNOSTICS=0 (or no BL_DIAG_DIR) the callers exec exactly as before.
+"""
+import fcntl
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+SCHEMA = 1
+DEFAULT_OUTPUT_CAP = 32 * 1024 * 1024
+MAX_OUTPUT_CAP = 1024 * 1024 * 1024
+# Linux's F_SETPIPE_SZ: a 1 MiB pipe lets a burst of Wine's messages through while this process
+# is not scheduled, rather than making the game's write() wait for it.
+F_SETPIPE_SZ = 1031
+PIPE_SIZE = 1024 * 1024
+FORWARDED = ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2")
+OFF = ("0", "off", "false", "no")
+MAX_ARGS = 64
+MAX_ARG_LENGTH = 256
+
+# A launch argument or environment value that carries a credential: Epic's -AUTH_PASSWORD=<code>,
+# -epicovt=<token>, a --password <value> pair, anything named like a token, key or session.
+SECRET_NAME = re.compile(
+    r"(?i)(password|passwd|pwd|token|secret|auth|ticket|apikey|api_key|private[_-]?key|session|cookie|"
+    r"credential|epicovt|exchange[_-]?code|otp)")
+URL_QUERY = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://[^\s?#]*)[?#]\S*")
+
+
+def enabled(env):
+    """The directory to record into, or None: diagnostics are off or it is not writable."""
+    if env.get("DROIDDECK_DIAGNOSTICS", "1").strip().lower() in OFF:
+        return None
+    directory = env.get("BL_DIAG_DIR")
+    if not directory or not os.path.isdir(directory) or not os.access(directory, os.W_OK):
+        return None
+    return directory
+
+
+def output_cap(env):
+    try:
+        cap = int(env.get("BL_DIAG_OUTPUT_CAP", DEFAULT_OUTPUT_CAP))
+    except (TypeError, ValueError):
+        return DEFAULT_OUTPUT_CAP
+    return max(0, min(cap, MAX_OUTPUT_CAP))
+
+
+def new_launch_id(now=None):
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    return "%s-%d-%s" % (stamp, os.getpid(), secrets.token_hex(3))
+
+
+def boot_ns():
+    """CLOCK_BOOTTIME: the clock Android's SystemClock.elapsedRealtimeNanos() reads, so the app can
+    line the guest's times up with its own; it keeps counting through deep sleep."""
+    try:
+        return time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.monotonic_ns()
+
+
+def read_first_line(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readline().strip() or None
+    except OSError:
+        return None
+
+
+def boot_id():
+    return read_first_line("/proc/sys/kernel/random/boot_id")
+
+
+def start_time(pid):
+    """/proc/<pid>/stat's start time in clock ticks: with the pid it names the process, not the number."""
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as f:
+            stat = f.read()
+        return int(stat.rsplit(") ", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def file_size(path):
+    try:
+        return os.stat(path).st_size if path else None
+    except OSError:
+        return None
+
+
+def iso(unix):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(unix)) + ".%03dZ" % int((unix % 1) * 1000)
+
+
+def redact_args(args):
+    """Launch arguments as a report may show them: a credential's value blanked, wherever it is -
+    `-AUTH_PASSWORD=x`, `--token x`, a URL's query - and long or many arguments cut short."""
+    out = []
+    blank_next = False
+    for arg in list(args)[:MAX_ARGS]:
+        arg = str(arg)
+        if blank_next:
+            out.append("<redacted>")
+            blank_next = False
+            continue
+        if "://" in arg:
+            arg = URL_QUERY.sub(r"\1?<redacted>", arg)
+        elif "=" in arg and SECRET_NAME.search(arg.split("=", 1)[0]):
+            out.append(arg.split("=", 1)[0] + "=<redacted>")
+            continue
+        if arg.startswith("-") and SECRET_NAME.search(arg):
+            out.append(arg)
+            blank_next = True
+            continue
+        out.append(arg if len(arg) <= MAX_ARG_LENGTH else arg[:MAX_ARG_LENGTH] + "...")
+    if len(args) > MAX_ARGS:
+        out.append("... %d more" % (len(args) - MAX_ARGS))
+    return out
+
+
+def exe_label(path):
+    """The game's executable without the user's own folders: from the library's common/ down when it
+    is in one, else its name only."""
+    if not path:
+        return None
+    text = str(path).replace("\\", "/")
+    marker = "/steamapps/common/"
+    if marker in text:
+        return text.split(marker, 1)[1]
+    return text.rsplit("/", 1)[-1]
+
+
+NAME = re.compile(r'^\s*"name"\s+"((?:[^"\\]|\\.)*)"', re.MULTILINE)
+LIBRARY_PATH = re.compile(r'^\s*"path"\s+"((?:[^"\\]|\\.)*)"', re.MULTILINE)
+
+
+def manifest_name(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = NAME.search(f.read(65536))
+        return m.group(1).replace('\\"', '"') if m else None
+    except OSError:
+        return None
+
+
+def game_name(app_id, env, exe=None):
+    """(name, where it came from): the library's appmanifest, else the executable's name."""
+    if app_id:
+        candidates = []
+        install = env.get("STEAM_COMPAT_INSTALL_PATH")
+        if install:
+            candidates.append(Path(install).parent.parent)
+        root = Path(env.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or Path(env.get("HOME") or "/root") / ".local/share/Steam")
+        candidates.append(root / "steamapps")
+        try:
+            text = (root / "steamapps/libraryfolders.vdf").read_text(encoding="utf-8", errors="replace")
+            candidates += [Path(p.replace("\\\\", "\\")) / "steamapps" for p in LIBRARY_PATH.findall(text)]
+        except OSError:
+            pass
+        candidates += [Path("/mnt/droiddeck/steamapps"), Path("/mnt/droiddeck-sd/steamapps")]
+        seen = set()
+        for steamapps in candidates:
+            if steamapps in seen:
+                continue
+            seen.add(steamapps)
+            name = manifest_name(steamapps / ("appmanifest_%s.acf" % app_id))
+            if name:
+                return name, "appmanifest"
+    if exe:
+        stem = str(exe).replace("\\", "/").rsplit("/", 1)[-1]
+        stem = re.sub(r"(?i)\.(exe|sh|x86_64|x86|bin)$", "", stem)
+        if stem:
+            return stem, "executable"
+    return None, "unknown"
+
+
+def write_record(path, record):
+    """[record] as [path], through a rename, synced: a record is whole or absent, also after a crash."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=1, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError) as error:
+        print("droiddeck-game-diag: %s not written (%s)" % (os.path.basename(path), error), file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+class Tee:
+    """The child's stderr through a pipe: every byte on to where stderr went before, and the first
+    [cap] bytes into [path]. A failure on either side stops only that side."""
+
+    def __init__(self, path, cap, passthrough=2):
+        self.path = path
+        self.cap = cap
+        self.passthrough = passthrough
+        self.seen = 0
+        self.kept = 0
+        self.errors = []
+        self.capped = False
+        self.read_fd, self.write_fd = os.pipe()
+        try:
+            fcntl.fcntl(self.write_fd, F_SETPIPE_SZ, PIPE_SIZE)
+        except OSError:
+            pass
+        try:
+            self.out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        except OSError as error:
+            self.out = None
+            self.errors.append("output file: %s" % error)
+        self.thread = threading.Thread(target=self.pump, name="diag-tee", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def child_started(self):
+        """The child holds its own copy of the write end now; ours closes so the pipe ends with it."""
+        try:
+            os.close(self.write_fd)
+        except OSError:
+            pass
+
+    def pump(self):
+        while True:
+            try:
+                data = os.read(self.read_fd, 65536)
+            except OSError as error:
+                self.errors.append("read: %s" % error)
+                break
+            if not data:
+                break
+            self.seen += len(data)
+            if self.passthrough is not None:
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(self.passthrough, view):]
+                except OSError as error:
+                    self.errors.append("passthrough: %s" % error)
+                    self.passthrough = None
+            if self.out is not None:
+                room = self.cap - self.kept
+                chunk = data[:room] if room < len(data) else data
+                try:
+                    if chunk:
+                        os.write(self.out, chunk)
+                        self.kept += len(chunk)
+                    if len(chunk) < len(data):
+                        self.capped = True
+                        os.write(self.out, b"\n[droiddeck-game-diag: output capped at %d bytes; the rest went to the session log only]\n" % self.cap)
+                        self.close_out()
+                except OSError as error:
+                    self.errors.append("write: %s" % error)
+                    self.close_out()
+        try:
+            os.close(self.read_fd)
+        except OSError:
+            pass
+
+    def close_out(self):
+        if self.out is not None:
+            try:
+                os.close(self.out)
+            except OSError:
+                pass
+            self.out = None
+
+    def finish(self, timeout):
+        """Waits up to [timeout] s for the pipe to end; a process the game left behind may hold it."""
+        self.thread.join(timeout)
+        complete = not self.thread.is_alive()
+        if complete:
+            self.close_out()
+        return {"file": os.path.basename(self.path), "bytes_seen": self.seen, "bytes_kept": self.kept,
+                "cap": self.cap, "capped": self.capped, "complete": complete, "errors": self.errors[:8]}
+
+
+def decode_status(status):
+    if os.WIFSIGNALED(status):
+        sig = os.WTERMSIG(status)
+        return {"exited": False, "exit_code": None, "signal": sig, "signal_name": signal_name(sig),
+                "core_dumped": bool(os.WCOREDUMP(status))}
+    if os.WIFEXITED(status):
+        return {"exited": True, "exit_code": os.WEXITSTATUS(status), "signal": None, "signal_name": None,
+                "core_dumped": False}
+    return {"exited": False, "exit_code": None, "signal": None, "signal_name": None, "core_dumped": False}
+
+
+def signal_name(number):
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return "SIG%d" % number
+
+
+def reported(decoded):
+    """The status this launcher exits with: the child's code, or 128 + N for a signal."""
+    if decoded["exited"]:
+        return decoded["exit_code"]
+    if decoded["signal"]:
+        return 128 + decoded["signal"]
+    return 1
+
+
+def run(command, env, meta, directory, stock=None, on_stock=None, popen=subprocess.Popen, wait=os.waitpid,
+        out_cap=None, tee_timeout=2.0):
+    """Starts [command] with [env], waits for it and records the launch in [directory]. [stock] is the
+    (command, env) to try when [command] cannot be started at all (a sync pack's launcher missing),
+    [on_stock] is told when it is used. Returns the status to exit with."""
+    launch_id = new_launch_id()
+    base = os.path.join(directory, launch_id)
+    cap = output_cap(env) if out_cap is None else out_cap
+    tee = None
+    output = None
+    if cap > 0:
+        try:
+            tee = Tee(base + ".out.log", cap)
+        except OSError as error:
+            output = {"file": None, "errors": ["pipe: %s" % error]}
+
+    pending = []
+    child = None
+
+    def forward(number, _frame):
+        name = signal_name(number)
+        pending.append(name)
+        if child is not None:
+            try:
+                os.kill(child.pid, number)
+            except OSError:
+                pass
+
+    previous = {}
+    for name in FORWARDED:
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            previous[number] = signal.signal(number, forward)
+        except (OSError, ValueError):
+            pass
+
+    # A launcher started with SIGCHLD ignored would have its child reaped by the kernel and never see
+    # its status. Waited on with the default here; the child still starts with it ignored, as an
+    # exec'd launch would have left it.
+    restore_chld = None
+    try:
+        if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+            previous[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            restore_chld = lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    except (OSError, ValueError):
+        pass
+
+    started_unix = time.time()
+    started_boot = boot_ns()
+    errors = []
+    used = None
+    attempts = [(command, env, False)] + ([(stock[0], stock[1], True)] if stock else [])
+    try:
+        for argv, argv_env, is_stock in attempts:
+            try:
+                child = popen(argv, env=argv_env, close_fds=False, restore_signals=False,
+                              stderr=tee.write_fd if tee else None, preexec_fn=restore_chld)
+                used = (argv, is_stock)
+                break
+            except OSError as error:
+                errors.append({"program": os.path.basename(argv[0]), "error": str(error), "errno": error.errno})
+                if not is_stock and stock:
+                    print("droiddeck-game-env: %s could not start (%s); stock launch" % (argv[0], error), file=sys.stderr)
+                    if on_stock:
+                        on_stock()
+        if tee:
+            tee.child_started()
+            tee.start()
+        for name in list(pending):
+            number = getattr(signal, name, None)
+            if child is not None and number is not None:
+                try:
+                    os.kill(child.pid, number)
+                except OSError:
+                    pass
+
+        start = dict(meta)
+        start.update({
+            "schema": SCHEMA,
+            "launch_id": launch_id,
+            "started_utc": iso(started_unix),
+            "started_unix_ms": int(started_unix * 1000),
+            "started_boot_ns": started_boot,
+            "boot_id": boot_id(),
+            "wrapper_pid": os.getpid(),
+            "child_pid": child.pid if child is not None else None,
+            "child_start_time": start_time(child.pid) if child is not None else None,
+            "program": os.path.basename(used[0][0]) if used else os.path.basename(command[0]),
+            "stock_fallback": bool(used and used[1]),
+            "session_log_offset": file_size(env.get("BL_LOG")),
+            "output_file": os.path.basename(tee.path) if tee and tee.out is not None else None,
+        })
+        write_record(base + ".start.json", start)
+
+        if child is None:
+            decoded = {"exited": False, "exit_code": None, "signal": None, "signal_name": None, "core_dumped": False}
+            status = None
+            code = 127 if any(e.get("errno") == 2 for e in errors) else 126
+        else:
+            status = None
+            while True:
+                try:
+                    _, status = wait(child.pid, 0)
+                    break
+                except ChildProcessError:
+                    break
+                except InterruptedError:
+                    continue
+            decoded = decode_status(status) if status is not None else \
+                {"exited": False, "exit_code": None, "signal": None, "signal_name": None, "core_dumped": False}
+            child.returncode = -decoded["signal"] if decoded["signal"] else (decoded["exit_code"] if decoded["exited"] else 1)
+            code = reported(decoded)
+        ended_unix = time.time()
+        ended_boot = boot_ns()
+        if tee:
+            output = tee.finish(tee_timeout)
+        record = {
+            "schema": SCHEMA,
+            "launch_id": launch_id,
+            "ended_utc": iso(ended_unix),
+            "ended_unix_ms": int(ended_unix * 1000),
+            "ended_boot_ns": ended_boot,
+            "duration_ms": (ended_boot - started_boot) // 1000000,
+            "raw_status": status,
+            "launch_failed": child is None,
+            "exec_errors": errors,
+            "forwarded_signals": pending,
+            "reported_status": code,
+            "session_log_offset": file_size(env.get("BL_LOG")),
+            "output": output,
+        }
+        record.update(decoded)
+        write_record(base + ".exit.json", record)
+        return code
+    finally:
+        for number, handler in previous.items():
+            try:
+                signal.signal(number, handler)
+            except (OSError, ValueError):
+                pass

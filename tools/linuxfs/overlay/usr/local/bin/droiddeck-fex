@@ -496,11 +496,49 @@ def resolve(program, env):
     return shutil.which(program, path=env.get("PATH")) or program
 
 
-def launch(command, env, mode, decide=None):
+def load_diag():
+    try:
+        return runpy.run_path(os.path.join(BIN_DIR, "droiddeck-game-diag"))
+    except Exception as error:
+        say("game diagnostics unavailable (%s)" % error)
+        return None
+
+
+def recorded(argv, env, record, how, program, exec_):
+    """A Steam game launch the app records (droiddeck-game-diag): started and waited on, so how it ended
+    reaches the app. Anything else, or with diagnostics off, is exec'd as it always was."""
+    diag = load_diag() if record and env.get("BL_DIAG_DIR") else None
+    directory = diag["enabled"](env) if diag else None
+    if not directory:
+        return exec_()
+    app = None
+    try:
+        game_env = runpy.run_path(os.path.join(BIN_DIR, "droiddeck-game-env"))
+        app = game_env["game_id"](env) or env.get("SteamAppId") or env.get("SteamGameId")
+        key = game_env["game_key"](str(app)) if app and str(app).isdigit() and int(app) > 0 else None
+    except Exception:
+        key = None
+    name, source = diag["game_name"](str(app) if app else None, env, program)
+    meta = {
+        "launcher": how,
+        "app_id": str(app) if app else None,
+        "game_key": key,
+        "name": name,
+        "name_source": source,
+        "verb": "waitforexitandrun",
+        "tool": "droiddeck-fex",
+        "exe": diag["exe_label"](program),
+        "args": diag["redact_args"](argv[2:] if how == "fex" else argv[1:]),
+        "fex": {k: v for k, v in sorted(env.items()) if k.startswith("FEX_") and k != "FEX_THUNKCONFIG"},
+    }
+    return diag["run"](argv, env, meta, directory)
+
+
+def launch(command, env, mode, decide=None, record=False):
     program = resolve(command[0], env)
     use = mode == "on" or (mode == "auto" and needs_fex(decide or program))
     if not use:
-        return os.execvpe(command[0], command, env)
+        return recorded(command, env, record, "native", program, lambda: os.execvpe(command[0], command, env))
     fex = prepare()
     if fex is None:
         return 126
@@ -513,7 +551,8 @@ def launch(command, env, mode, decide=None):
         guest["LD_AUDIT"] = ":".join([THUNK_AUDIT_GUEST] + split_paths(guest.get("LD_AUDIT")))
         thunks = "on, its own Vulkan loader too"
     say("running %s with %s (runtime %s, thunks %s)" % (program, fex["bin"], guest.get("FEX_ROOTFS", "none"), thunks))
-    return os.execve(fex["bin"], [fex["bin"], program] + command[1:], guest)
+    argv = [fex["bin"], program] + command[1:]
+    return recorded(argv, guest, record, "fex", program, lambda: os.execve(fex["bin"], argv, guest))
 
 
 def game_environment(env):
@@ -635,7 +674,8 @@ def main(argv):
             return 0
         if not command:
             return 2
-        return launch(command, game_environment(dict(os.environ)), os.environ.get("DROIDDECK_FEX", "auto"))
+        return launch(command, game_environment(dict(os.environ)), os.environ.get("DROIDDECK_FEX", "auto"),
+                      record=verb == "waitforexitandrun")
     if action == "run":
         try:
             mode, decide, command = parse_run(args)

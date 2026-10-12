@@ -458,6 +458,31 @@ class LaunchTest(FexTestCase):
             FEX["main"](["steam", "waitforexitandrun", "/game/run.sh", "-a"])
             command, env, mode = G["launch"].call_args[0]
             self.assertEqual((command, mode), (["/game/run.sh", "-a"], "auto"))
+            self.assertTrue(G["launch"].call_args[1]["record"])
+            FEX["main"](["steam", "run", "/game/run.sh"])
+            self.assertFalse(G["launch"].call_args[1]["record"])
+
+    def test_a_steam_game_launch_is_recorded_when_the_app_asks(self):
+        program = self.write(self.tmp / "native", elf(183), 0o755)
+        inbox = self.tmp / "inbox"
+        inbox.mkdir()
+        calls = []
+        diag = {"enabled": lambda env: env.get("BL_DIAG_DIR"), "game_name": lambda app, env, exe: ("native", "executable"),
+                "exe_label": os.path.basename, "redact_args": list,
+                "run": lambda argv, env, meta, directory: calls.append((argv, meta, directory)) or 3}
+        with mock.patch.dict(G, {"load_diag": lambda: diag}), mock.patch("os.execvpe") as native:
+            code = FEX["launch"]([str(program), "-a"], {"BL_DIAG_DIR": str(inbox), "SteamAppId": "77"}, "auto", record=True)
+        native.assert_not_called()
+        self.assertEqual(code, 3)
+        argv, meta, directory = calls[0]
+        self.assertEqual((argv, meta["launcher"], meta["app_id"], meta["game_key"], meta["args"], directory),
+                         ([str(program), "-a"], "native", "77", "steam-77", ["-a"], str(inbox)))
+        # Not a recorded verb, or no directory from the app: exec'd as before.
+        with mock.patch.dict(G, {"load_diag": lambda: diag}), mock.patch("os.execvpe") as native:
+            FEX["launch"]([str(program)], {"BL_DIAG_DIR": str(inbox)}, "auto")
+            FEX["launch"]([str(program)], {}, "auto", record=True)
+        self.assertEqual(native.call_count, 2)
+        self.assertEqual(len(calls), 1)
 
 
 class AppInfoTest(unittest.TestCase):

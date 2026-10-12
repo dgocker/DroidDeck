@@ -263,17 +263,62 @@ PROFILE_KEYS = ("TU_DEBUG", "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "FEX_TSOENABL
                 "VKD3D_SHADER_MODEL", "MESA_SHADER_CACHE_DISABLE", "DROIDDECK_FORCE_SSBS")
 
 
-def profile_line(app_id, env):
-    values = []
+def profile_values(env):
+    """PROFILE_KEYS as the game gets them; None = not set. Driver manifests by file name only."""
+    values = {}
     for name in PROFILE_KEYS:
         value = env.get(name)
-        if value is None:
-            values.append(name + "=-")
-        elif name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES"):
-            values.append(name + "=" + ":".join(os.path.basename(p) for p in value.split(":") if p))
-        else:
-            values.append(name + "=" + value.replace("\n", " "))
+        if value is not None and name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES"):
+            value = ":".join(os.path.basename(p) for p in value.split(":") if p)
+        elif value is not None:
+            value = value.replace("\n", " ")
+        values[name] = value
+    return values
+
+
+def profile_line(app_id, env):
+    values = ["%s=%s" % (name, "-" if value is None else value) for name, value in profile_values(env).items()]
     return "droiddeck-game-env: graphics profile for app %s: %s" % (app_id, " ".join(values))
+
+
+DIAG = "droiddeck-game-diag"
+
+
+def load_diag():
+    """The launch recorder (droiddeck-game-diag), or None: a launch never fails over it."""
+    try:
+        return runpy.run_path(str(Path(__file__).resolve().parent / DIAG))
+    except Exception as error:
+        print("droiddeck-game-env: game diagnostics unavailable (%s)" % error, file=sys.stderr)
+        return None
+
+
+def game_key(app_id):
+    """Where a game's diagnostics are kept: Steam's own ids, and the ids the client gives shortcuts."""
+    return ("shortcut-" if int(app_id) >= 2**31 else "steam-") + app_id
+
+
+def launch_meta(app_id, command, launch, env, diag):
+    exe = command[2] if len(command) > 2 else None
+    name, source = diag["game_name"](app_id, env, exe)
+    sync = {}
+    for key in SYNC_KEYS + PACK_KEYS:
+        if key in env:
+            sync[key] = os.path.basename(env[key]) if key in ("WINESERVER", "BL_SYNC_PACK") else env[key]
+    return {
+        "launcher": "proton",
+        "app_id": app_id,
+        "game_key": game_key(app_id),
+        "name": name,
+        "name_source": source,
+        "verb": command[1],
+        "tool": os.path.basename(os.path.dirname(os.path.abspath(command[0]))),
+        "exe": diag["exe_label"](exe),
+        "args": diag["redact_args"](command[3:]),
+        "sync": "stock" if launch[0] == command[0] else os.path.basename(launch[0]),
+        "sync_env": sync,
+        "graphics": profile_values(env),
+    }
 
 
 EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
@@ -336,6 +381,16 @@ def main():
         print(profile_line(app_id, env), file=sys.stderr)
     sync = load_sync()
     launch, launch_env = select_sync(command, env, sync)
+    # A game launch the app records (droiddeck-game-diag): started and waited on rather than exec'd,
+    # so how it ended reaches the app. The stock launch stays the fallback for a pack that cannot start.
+    recordable = app_id and len(command) > 1 and command[1] == "waitforexitandrun" and launch_env.get("BL_DIAG_DIR")
+    diag = load_diag() if recordable else None
+    directory = diag["enabled"](launch_env) if diag else None
+    if directory:
+        stock = (command, without_pack(launch_env, env)) if launch[0] != command[0] else None
+        meta = launch_meta(app_id, command, launch, launch_env, diag)
+        return diag["run"](launch, launch_env, meta, directory, stock=stock,
+                           on_stock=(lambda: record_stock(sync, stock[0], stock[1])) if stock else None)
     if launch[0] != command[0]:
         try:
             os.execvpe(launch[0], launch, launch_env)
