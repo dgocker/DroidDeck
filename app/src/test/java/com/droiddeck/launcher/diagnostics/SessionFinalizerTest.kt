@@ -288,6 +288,10 @@ class SessionFinalizerTest {
         val s = finish(noFex)!!
         assertTrue(missing(s)["fex_stats.csv"]!!.contains("FEX wrote no statistics"))
         assertTrue(missing(s)["cpu.csv"]!!.contains("did not let"))
+        // A game that ended within the first interval had its statistics removed before any sample.
+        val short = launcher.start(output = "x\n", startMs = t0 + 15)
+        launcher.exit(short, code = 1, durationMs = 3_500, sampled = true)
+        assertEquals("the game ended after 3 s, before the first sample (every 5 s)", missing(finish(short)!!)["fex_stats.csv"])
         // Without the timer's frequency the ticks stay as they are.
         val ticks = launcher.start(output = "x\n", startMs = t0 + 20)
         File(store.inbox, "${ticks.id}.fex.csv").writeText("t_s,jit_ticks\n10.0,5\n")

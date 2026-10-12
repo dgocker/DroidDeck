@@ -21,7 +21,12 @@ What the columns are, and what they are not:
   low1%         1000 / the median of the windows' p99 commit interval: an estimate of the 1% low FPS
                 from per-window percentiles, not from a run-wide distribution of frame times.
   clk_max/min   the highest and lowest per-CPU mean clock over the warm phase, MHz.
-  temp_max      the hottest thermal zone seen, degrees C, and its zone name.
+  cap           the lowest clock limit any cluster was held at in the warm phase (scaling_max_freq),
+                MHz; hw_max is the clusters' hardware maxima from the launch's start. A cap under
+                hw_max is a throttled or power-limited CPU, not a lightly loaded one.
+  cpu_temp/gpu_temp  the hottest CPU and GPU thermal zones seen, degrees C.
+  temp_max      the hottest thermal zone of any kind, degrees C, and its zone name (board sensors
+                that read a constant value land here too; trust cpu_temp/gpu_temp first).
 """
 
 from __future__ import annotations
@@ -106,12 +111,20 @@ def cpu_summary(samples: list[dict], warmup: float) -> dict:
             values = [v for v in (number(r.get(col)) for r in warm) if v is not None]
             if values:
                 means.append(statistics.fmean(values) / 1000.0)
+    caps = [v for r in warm for col in r if col.startswith("policy") and col.endswith("_max_khz")
+            for v in [number(r.get(col))] if v is not None]
     hottest, zone = None, ""
     for r in samples:
         t = number(r.get("thermal_max_millic"))
         if t is not None and (hottest is None or t > hottest):
             hottest, zone = t, r.get("thermal_max_zone", "")
+
+    def peak(col):
+        values = [v for v in (number(r.get(col)) for r in samples) if v is not None]
+        return max(values) / 1000.0 if values else None
     return {"clk_max": max(means) if means else None, "clk_min": min(means) if means else None,
+            "cap": min(caps) / 1000.0 if caps else None,
+            "cpu_temp": peak("cpu_temp_max_millic"), "gpu_temp": peak("gpu_temp_max_millic"),
             "temp_max": hottest / 1000.0 if hottest is not None else None, "temp_zone": zone}
 
 
@@ -137,11 +150,13 @@ def summarise(folder: Path, warmup: float) -> dict:
         "launch": folder.name,
         "game": (manifest.get("game") or {}).get("name") or (manifest.get("game") or {}).get("key"),
         "status": (manifest.get("status") or {}).get("status"),
-        "duration_s": duration,
+        "duration_s": end,  # a launch with no exit record runs to its last sample
         "fex_build": ",".join(sorted(set(v for v in (fex.get("build") or {}).values() if isinstance(v, str)))) or ",".join(phases["versions"]),
         "fex_env": " ".join("%s=%s" % kv for kv in sorted((fex.get("env") or {}).items())),
         "session": " ".join("%s=%s" % kv for kv in sorted(((manifest.get("graphics") or {}).get("session") or {}).items())),
         "sve_bits": device.get("sve_vector_bits"),
+        "hw_max": "/".join("%.0f" % (p["cpuinfo_max_khz"] / 1000.0) for p in ((launch.get("host_cpu") or {}).get("policies") or {}).values()
+                           if isinstance(p, dict) and isinstance(p.get("cpuinfo_max_khz"), (int, float))),
     }
     for phase, seconds in (("cold", cold_s), ("warm", warm_s)):
         p = phases[phase]
@@ -157,7 +172,8 @@ def summarise(folder: Path, warmup: float) -> dict:
 COLUMNS = (("launch", "%s"), ("status", "%s"), ("duration_s", "%.0f"), ("fps", "%.1f"), ("low1", "%.1f"),
            ("cold_jit_ms_s", "%.1f"), ("warm_jit_ms_s", "%.2f"), ("warm_signal_ms_s", "%.2f"),
            ("warm_sigbus_s", "%.1f"), ("warm_smc_s", "%.2f"), ("warm_cache_misses_s", "%.1f"),
-           ("warm_jit_blocks_s", "%.1f"), ("clk_max", "%.0f"), ("clk_min", "%.0f"), ("temp_max", "%.1f"))
+           ("warm_jit_blocks_s", "%.1f"), ("clk_max", "%.0f"), ("clk_min", "%.0f"), ("cap", "%.0f"), ("hw_max", "%s"),
+           ("cpu_temp", "%.1f"), ("gpu_temp", "%.1f"), ("temp_max", "%.1f"))
 
 
 def cell(value, fmt):

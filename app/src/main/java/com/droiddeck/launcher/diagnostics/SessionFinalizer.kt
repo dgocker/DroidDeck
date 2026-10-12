@@ -156,6 +156,9 @@ class SessionFinalizer(
                 if (counterHz != null) "; *_ms columns from the timer's $counterHz Hz" else "; times in timer ticks (the timer frequency was not known)",
             when {
                 exit != null && samples == null -> "the launcher took no samples (BL_DIAG_SAMPLE_INTERVAL=0, or a launcher from before sampling)"
+                // FEX removes its statistics when a process ends; the last sample comes after the game did.
+                exit != null && exit.durationMs in 0 until (samples?.optDouble("interval_s", 10.0) ?: 10.0).times(1000).toLong() ->
+                    "the game ended after ${exit.durationMs / 1000} s, before the first sample (every $every s)"
                 start.launcher == "native" -> "not run under FEX"
                 else -> "FEX wrote no statistics for the game's processes (ProfileStats off in its configuration, or /dev/shm not writable)"
             })
@@ -333,7 +336,8 @@ class SessionFinalizer(
                 .put("sync", start.json.opt("sync") ?: JSONObject.NULL)
                 .put("sync_env", start.json.optJSONObject("sync_env") ?: JSONObject())
                 .put("fex", start.json.optJSONObject("fex") ?: JSONObject.NULL)
-                .put("guest_cpu_ids", start.json.optJSONObject("cpu_ids") ?: JSONObject.NULL))
+                .put("guest_cpu_ids", start.json.optJSONObject("cpu_ids") ?: JSONObject.NULL)
+                .put("host_cpu", start.json.optJSONObject("host_cpu") ?: JSONObject.NULL))
             .put("graphics", JSONObject()
                 .put("requested", start.json.optJSONObject("graphics") ?: JSONObject.NULL)
                 .put("session", JSONObject(info.session.mapValues { DiagEvent.jsonValue(it.value) }))

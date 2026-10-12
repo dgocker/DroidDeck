@@ -38,7 +38,8 @@ def fake_popen(log, fail=()):
 
 
 def fake_wait(status):
-    return lambda pid, options: (pid, status)
+    # The launcher waits for any child (-1): the one it started is the last FakeChild made.
+    return lambda pid, options: (FakeChild.next_pid if pid == -1 else pid, status)
 
 
 def records(directory):
@@ -271,6 +272,46 @@ class CpuIdsTest(unittest.TestCase):
             self.assertEqual(DIAG["cpu_ids"](str(Path(tmp) / "none"))["midr_el1"], [])
 
 
+class SubreaperTest(unittest.TestCase):
+    def test_orphans_wine_hands_over_are_reaped_and_the_game_is_found_in_the_tree(self):
+        # Run in a child process: becoming a subreaper sticks to the process that asks.
+        script = r"""
+import os, runpy, sys, time
+DIAG = runpy.run_path(sys.argv[1])
+assert DIAG["become_subreaper"](), "prctl"
+child = os.fork()
+if child == 0:
+    # Wine's spawn_process: fork, fork again, the middle one exits at once.
+    if os.fork() == 0:
+        time.sleep(0.5)
+        os._exit(7)
+    os._exit(0)
+time.sleep(0.2)
+# The grandchild was handed to this process, as the game is to the launcher.
+grandchildren = [int(p) for p in os.listdir("/proc") if p.isdigit() and DIAG["parent_pid"](int(p)) == os.getpid()]
+assert grandchildren, "no orphan was handed over"
+assert DIAG["in_tree"](grandchildren[0], os.getpid(), {}), "not in the launcher's tree"
+status = DIAG["wait_for"](child)
+assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+time.sleep(0.6)
+# The orphan exited meanwhile; waiting for the child reaped it on the way or now, never a zombie left.
+DIAG["wait_for"](-2)
+leftover = [p for p in os.listdir("/proc") if p.isdigit() and DIAG["parent_pid"](int(p)) == os.getpid()]
+assert not leftover, leftover
+print("ok")
+"""
+        out = subprocess.run([sys.executable, "-c", script, str(BIN / "droiddeck-game-diag")],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "ok", out.stderr)
+
+    def test_waiting_reaps_others_until_the_child(self):
+        calls = iter([(11, 0), (12, 256), (42, 3 << 8)])
+        self.assertEqual(DIAG["wait_for"](42, lambda pid, options: next(calls)), 3 << 8)
+        def gone(pid, options):
+            raise ChildProcessError()
+        self.assertIsNone(DIAG["wait_for"](42, gone))
+
+
 class SamplerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -283,8 +324,14 @@ class SamplerTest(unittest.TestCase):
             d = self.sys / ("devices/system/cpu/cpu%d/cpufreq" % cpu)
             d.mkdir(parents=True)
             (d / "scaling_cur_freq").write_text("%d\n" % khz)
-        (self.sys / "devices/system/cpu/cpufreq").mkdir(parents=True)  # not a cpuN entry
-        for z, (kind, temp) in enumerate((("cpu-0-0", 41000), ("gpu", 47500))):
+        for policy, (cpus, hw, cap) in (("policy0", ("0", 3300000, 1900800)), ("policy1", ("1", 3800000, 3800000))):
+            d = self.sys / ("devices/system/cpu/cpufreq/%s" % policy)  # not a cpuN entry
+            d.mkdir(parents=True)
+            (d / "related_cpus").write_text(cpus + "\n")
+            (d / "cpuinfo_max_freq").write_text("%d\n" % hw)
+            (d / "scaling_max_freq").write_text("%d\n" % cap)
+            (d / "scaling_governor").write_text("walt\n")
+        for z, (kind, temp) in enumerate((("cpu-0-0", 41000), ("gpu", 47500), ("sys-therm-5", 110334))):
             d = self.sys / ("class/thermal/thermal_zone%d" % z)
             d.mkdir(parents=True)
             (d / "temp").write_text("%d\n" % temp)
@@ -331,7 +378,18 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(rows[0]["fex_version"], "FEX-2609-137-g0df84d3")
         cpu = self.rows("cpu")
         self.assertEqual((cpu[0]["cpu0_khz"], cpu[0]["cpu1_khz"]), ("1800000", "3300000"))
-        self.assertEqual((cpu[0]["thermal_max_millic"], cpu[0]["thermal_max_zone"]), ("47500", "gpu"))
+        # The clusters' clock limits: policy0 held at 1.9 GHz under its 3.3 GHz maximum.
+        self.assertEqual((cpu[0]["policy0_max_khz"], cpu[0]["policy1_max_khz"]), ("1900800", "3800000"))
+        # A board zone that reads 110 C does not hide the CPU's and GPU's own.
+        self.assertEqual((cpu[0]["cpu_temp_max_millic"], cpu[0]["gpu_temp_max_millic"]), ("41000", "47500"))
+        self.assertEqual((cpu[0]["thermal_max_millic"], cpu[0]["thermal_max_zone"]), ("110334", "sys-therm-5"))
+
+    def test_the_start_record_names_the_clusters_limits_and_every_zone(self):
+        info = DIAG["host_cpu"](str(self.sys))
+        self.assertEqual(info["policies"]["policy0"], {"cpus": "0", "cpuinfo_max_khz": 3300000, "cpuinfo_min_khz": None,
+                                                       "scaling_max_khz": 1900800, "scaling_min_khz": None, "governor": "walt"})
+        self.assertEqual(info["thermal_zones"], [["cpu-0-0", 41000], ["gpu", 47500], ["sys-therm-5", 110334]])
+        self.assertEqual(DIAG["host_cpu"](str(Path(self.tmp.name) / "none")), {"policies": {}, "thermal_zones": []})
 
     def test_rows_stop_at_the_limit_and_unreadable_sources_are_skipped(self):
         sampler = DIAG["Sampler"](self.base, os.getpid(), interval=3600, limit=100, shm=str(self.shm / "missing"),

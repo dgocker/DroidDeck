@@ -391,6 +391,87 @@ def cpu_ids(sys_root="/sys"):
     return {"midr_el1": sorted(values), "error": error}
 
 
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_subreaper():
+    """Makes this process the one orphaned descendants are handed to. Wine starts every Windows
+    process with a double fork (dlls/ntdll/unix/process.c, spawn_process): without this the game's own
+    process (java.exe, the game's .exe) leaves the launcher's tree for Steam's reaper, and nothing
+    here can tell it belongs to the launch. True when the kernel took it."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def wait_for(child_pid, wait=os.waitpid):
+    """The wait status of [child_pid]; the descendants handed to this process as their subreaper are
+    reaped on the way, so none is left a zombie. None when there is nothing to wait for."""
+    while True:
+        try:
+            pid, status = wait(-1, 0)
+        except ChildProcessError:
+            return None
+        except InterruptedError:
+            continue
+        if pid == child_pid:
+            return status
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def cpu_policies(sys_root="/sys"):
+    """The cpufreq policies (clusters) by number: policyN -> its directory."""
+    base = os.path.join(sys_root, "devices/system/cpu/cpufreq")
+    try:
+        names = [n for n in os.listdir(base) if re.fullmatch(r"policy\d+", n)]
+    except OSError:
+        return {}
+    return {n: os.path.join(base, n) for n in sorted(names, key=lambda n: int(n[6:]))}
+
+
+def zone_group(kind):
+    """cpu or gpu for a thermal zone's type, None for any other zone (board, battery, modem...)."""
+    kind = kind.lower()
+    return "gpu" if "gpu" in kind else "cpu" if "cpu" in kind else None
+
+
+def host_cpu(sys_root="/sys"):
+    """What limits the CPU when the launch starts: each cluster's cores, hardware and current clock
+    limits and governor, and every thermal zone by type - a zone that reads the same 110 C whether the
+    phone is idle or not is then seen for what it is."""
+    policies = {}
+    for name, d in cpu_policies(sys_root).items():
+        policies[name] = {
+            "cpus": read_text(os.path.join(d, "related_cpus")) or read_text(os.path.join(d, "affected_cpus")),
+            "cpuinfo_max_khz": read_int(os.path.join(d, "cpuinfo_max_freq")),
+            "cpuinfo_min_khz": read_int(os.path.join(d, "cpuinfo_min_freq")),
+            "scaling_max_khz": read_int(os.path.join(d, "scaling_max_freq")),
+            "scaling_min_khz": read_int(os.path.join(d, "scaling_min_freq")),
+            "governor": read_text(os.path.join(d, "scaling_governor")),
+        }
+    zones = []
+    thermal = os.path.join(sys_root, "class/thermal")
+    try:
+        names = sorted((n for n in os.listdir(thermal) if n.startswith("thermal_zone")), key=lambda n: int(n[12:] or 0))
+    except (OSError, ValueError):
+        names = []
+    for z in names:
+        temp = read_int(os.path.join(thermal, z, "temp"))
+        if temp is not None:
+            zones.append([read_text(os.path.join(thermal, z, "type")) or z, temp])
+    return {"policies": policies, "thermal_zones": zones}
+
+
 def read_int(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -415,6 +496,7 @@ class Sampler:
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, name="diag-sampler", daemon=True)
         self.cpus = sorted(int(n[3:]) for n in self.listdir(os.path.join(sys_root, "devices/system/cpu")) if re.fullmatch(r"cpu\d+", n))
+        self.policies = cpu_policies(sys_root)
 
     @staticmethod
     def listdir(path):
@@ -486,20 +568,26 @@ class Sampler:
             self.write("fex", "t_s,pid,app_type,fex_version,threads," + ",".join(FEX_COUNTERS),
                        ",".join([t, str(pid), header["app_type"], header["version"], str(len(threads))] + [str(v) for v in total]))
         freqs = [read_int(os.path.join(self.sys, "devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq" % c)) for c in self.cpus]
-        hottest, zone = None, ""
+        # Each cluster's clock limit now: below its hardware maximum it is held down (thermal, a power mode).
+        limits = [read_int(os.path.join(d, "scaling_max_freq")) for d in self.policies.values()]
+        hottest, zone, group_max = None, "", {"cpu": None, "gpu": None}
         thermal = os.path.join(self.sys, "class/thermal")
         for z in sorted(self.listdir(thermal)):
             temp = read_int(os.path.join(thermal, z, "temp"))
-            if temp is not None and (hottest is None or temp > hottest):
-                hottest = temp
-                try:
-                    with open(os.path.join(thermal, z, "type"), encoding="utf-8") as f:
-                        zone = f.read().strip().replace(",", " ")
-                except OSError:
-                    zone = z
-        if any(v is not None for v in freqs) or hottest is not None:
-            self.write("cpu", "t_s," + ",".join("cpu%d_khz" % c for c in self.cpus) + ",thermal_max_millic,thermal_max_zone",
-                       ",".join([t] + ["" if v is None else str(v) for v in freqs] + ["" if hottest is None else str(hottest), zone]))
+            if temp is None:
+                continue
+            kind = read_text(os.path.join(thermal, z, "type")) or z
+            group = zone_group(kind)
+            if group and (group_max[group] is None or temp > group_max[group]):
+                group_max[group] = temp
+            if hottest is None or temp > hottest:
+                hottest, zone = temp, kind.replace(",", " ")
+        if any(v is not None for v in freqs + limits) or hottest is not None:
+            self.write("cpu", "t_s," + ",".join("cpu%d_khz" % c for c in self.cpus)
+                       + "".join(",%s_max_khz" % p for p in self.policies)
+                       + ",cpu_temp_max_millic,gpu_temp_max_millic,thermal_max_millic,thermal_max_zone",
+                       ",".join([t] + ["" if v is None else str(v) for v in freqs + limits]
+                                + ["" if v is None else str(v) for v in (group_max["cpu"], group_max["gpu"], hottest)] + [zone]))
 
 
 def decode_status(status):
@@ -578,6 +666,7 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
     except (OSError, ValueError):
         pass
 
+    subreaper = become_subreaper()
     started_unix = time.time()
     started_boot = boot_ns()
     errors = []
@@ -603,7 +692,8 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
         interval = sample_interval(env)
         if child is not None and interval > 0:
             try:
-                sampler = Sampler(base, child.pid, interval)
+                # The launcher's own tree: with it a subreaper, every process of the game ends up in it.
+                sampler = Sampler(base, os.getpid() if subreaper else child.pid, interval)
                 sampler.start()
             except (OSError, RuntimeError):
                 sampler = None
@@ -630,7 +720,9 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
             "program": os.path.basename(used[0][0]) if used else os.path.basename(command[0]),
             "stock_fallback": bool(used and used[1]),
             "session_log_offset": file_size(env.get("BL_LOG")),
+            "subreaper": subreaper,
             "cpu_ids": cpu_ids(),
+            "host_cpu": host_cpu(),
             "output_file": os.path.basename(tee.path) if tee and tee.out is not None else None,
         })
         write_record(base + ".start.json", start)
@@ -640,15 +732,7 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
             status = None
             code = 127 if any(e.get("errno") == 2 for e in errors) else 126
         else:
-            status = None
-            while True:
-                try:
-                    _, status = wait(child.pid, 0)
-                    break
-                except ChildProcessError:
-                    break
-                except InterruptedError:
-                    continue
+            status = wait_for(child.pid, wait)
             decoded = decode_status(status) if status is not None else \
                 {"exited": False, "exit_code": None, "signal": None, "signal_name": None, "core_dumped": False}
             child.returncode = -decoded["signal"] if decoded["signal"] else (decoded["exit_code"] if decoded["exited"] else 1)

@@ -20,13 +20,15 @@ def launch(root: Path, name: str, fps: float, env=None, fex_rows=None, counter_h
         "status": {"status": "NORMAL_EXIT"},
         "time": {"duration_ms": 120000},
         "device": {"counter_hz": counter_hz, "sve_vector_bits": 0},
-        "launch": {"fex": {"build": {"libarm64ecfex.dll": "FEX-2609-137-g0df84d384"}, "env": env or {}}},
+        "launch": {"fex": {"build": {"libarm64ecfex.dll": "FEX-2609-137-g0df84d384"}, "env": env or {}},
+                   "host_cpu": {"policies": {"policy0": {"cpuinfo_max_khz": 3321600}, "policy6": {"cpuinfo_max_khz": 3801600}}}},
         "graphics": {"session": {"fps_limit": 60}},
     }))
     if fex_rows is not None:
         (d / "fex_stats.csv").write_text(FEX_HEADER + "\n" + "\n".join(fex_rows) + "\n")
-    (d / "cpu.csv").write_text("t_s,cpu0_khz,cpu1_khz,thermal_max_millic,thermal_max_zone\n"
-                               "30.0,2000000,3000000,40000,cpu-0\n90.0,1000000,3000000,52000,cpu-1\n")
+    (d / "cpu.csv").write_text("t_s,cpu0_khz,cpu1_khz,policy0_max_khz,policy6_max_khz,cpu_temp_max_millic,gpu_temp_max_millic,thermal_max_millic,thermal_max_zone\n"
+                               "30.0,2000000,3000000,3321600,3801600,40000,38000,110000,sys-therm-5\n"
+                               "90.0,1000000,3000000,1900800,3801600,52000,44000,110300,sys-therm-5\n")
     (d / "performance.csv").write_text("window_end_utc,seconds_since_launch,onscreen_fps,commit_p99_ms\n"
                                        "x,30,10,100\nx,70,%s,20\nx,80,%s,25\n" % (fps, fps))
     return d
@@ -53,7 +55,10 @@ class LaunchReportTest(unittest.TestCase):
         self.assertEqual(s["fps"], 60.0)
         self.assertAlmostEqual(s["low1"], 1000 / 22.5)
         self.assertEqual((s["clk_max"], s["clk_min"]), (3000.0, 1000.0))
-        self.assertEqual((s["temp_max"], s["temp_zone"]), (52.0, "cpu-1"))
+        self.assertEqual((s["temp_max"], s["temp_zone"]), (110.3, "sys-therm-5"))
+        # The warm phase saw policy0 held at 1.9 GHz under its 3.3 GHz hardware maximum.
+        self.assertEqual((s["cap"], s["hw_max"]), (1900.8, "3322/3802"))
+        self.assertEqual((s["cpu_temp"], s["gpu_temp"]), (52.0, 44.0))
 
     def test_missing_samples_leave_gaps_not_zeros(self):
         with tempfile.TemporaryDirectory() as tmp:
