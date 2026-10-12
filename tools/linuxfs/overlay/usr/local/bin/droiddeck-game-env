@@ -253,6 +253,29 @@ def force_ssbs(command, env):
     return env
 
 
+# What decides how a game draws, named in one line per launch so an A/B run can be read back from the
+# session log: the Turnip debug flags, which Vulkan driver the loader is pointed at, the FEX preset,
+# the translation layers' options and the SSBS adapter. Values as the game gets them, after every
+# profile; "-" = not set.
+PROFILE_KEYS = ("TU_DEBUG", "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "FEX_TSOENABLED", "FEX_VECTORTSOENABLED",
+                "FEX_MEMCPYSETTSOENABLED", "FEX_HALFBARRIERTSOENABLED", "FEX_MULTIBLOCK", "FEX_X87REDUCEDPRECISION",
+                "FEX_SMCCHECKS", "DXVK_CONFIG", "DXVK_ASYNC", "VKD3D_CONFIG", "VKD3D_FEATURE_LEVEL",
+                "VKD3D_SHADER_MODEL", "MESA_SHADER_CACHE_DISABLE", "DROIDDECK_FORCE_SSBS")
+
+
+def profile_line(app_id, env):
+    values = []
+    for name in PROFILE_KEYS:
+        value = env.get(name)
+        if value is None:
+            values.append(name + "=-")
+        elif name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES"):
+            values.append(name + "=" + ":".join(os.path.basename(p) for p in value.split(":") if p))
+        else:
+            values.append(name + "=" + value.replace("\n", " "))
+    return "droiddeck-game-env: graphics profile for app %s: %s" % (app_id, " ".join(values))
+
+
 EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
 
 
@@ -309,6 +332,8 @@ def main():
         except (OSError, ValueError, TypeError, AttributeError):
             print("droiddeck-game-env: invalid configuration; using inherited environment", file=sys.stderr)
     env = force_ssbs(command, env)
+    if app_id and len(command) > 1 and command[1] == "waitforexitandrun":
+        print(profile_line(app_id, env), file=sys.stderr)
     sync = load_sync()
     launch, launch_env = select_sync(command, env, sync)
     if launch[0] != command[0]:

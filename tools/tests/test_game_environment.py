@@ -219,6 +219,40 @@ class GameEnvironmentTest(unittest.TestCase):
             result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), "waitforexitandrun"], env={**env, "CUSTOM": "original"}, text=True, capture_output=True, check=True)
             self.assertEqual(json.loads(result.stdout)[0], "original")
 
+    def test_each_game_launch_names_its_graphics_profile(self):
+        # The A/B record: a game whose profile removes the session's TU_DEBUG says so at launch, the
+        # session's other games keep it, and probes and non-launch verbs say nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / ".config/droiddeck/game-environment.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"version": 1, "games": {"42": {"TU_DEBUG": None}}}))
+            probe = home / "fake-proton"
+            probe.write_text("#!/usr/bin/python3\nimport os\nprint(os.environ.get('TU_DEBUG', '-'))\n")
+            probe.chmod(0o755)
+            env = {**os.environ, "HOME": tmp, "TU_DEBUG": "sysmem",
+                   "VK_DRIVER_FILES": "/data/user/0/app/files/linux_driver/wn/freedreno_icd.aarch64.json",
+                   "FEX_TSOENABLED": "1"}
+            env.pop("DROIDDECK_FORCE_SSBS", None)
+
+            def launch(app, verb="waitforexitandrun"):
+                return subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), verb, "Game.exe"],
+                                      env={**env, "STEAM_COMPAT_DATA_PATH": "/compatdata/" + app},
+                                      text=True, capture_output=True, check=True)
+
+            removed = launch("42")
+            self.assertEqual(removed.stdout.strip(), "-")
+            line = [l for l in removed.stderr.splitlines() if "graphics profile" in l]
+            self.assertEqual(len(line), 1, removed.stderr)
+            self.assertIn("graphics profile for app 42: TU_DEBUG=- VK_DRIVER_FILES=freedreno_icd.aarch64.json", line[0])
+            self.assertIn("FEX_TSOENABLED=1", line[0])
+            self.assertIn("DROIDDECK_FORCE_SSBS=-", line[0])
+            kept = launch("43")
+            self.assertEqual(kept.stdout.strip(), "sysmem")
+            self.assertIn("graphics profile for app 43: TU_DEBUG=sysmem ", kept.stderr)
+            self.assertNotIn("graphics profile", launch("42", "run").stderr)
+            self.assertNotIn("graphics profile", launch("0").stderr)
+
     def test_generated_valve_and_third_party_launchers_apply_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
