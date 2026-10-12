@@ -240,8 +240,9 @@ public final class WaylandCompositor {
     public static native void nativeSetHideShell(boolean hide);
 
     /** The panel's refresh rate in Hz, advertised on the Wayland output so Wine's display modes
-     *  carry the real rate (games that insist on their saved 144 Hz mode find it, as on X11).
-     *  Set before the compositor starts. */
+     *  carry the real rate (games that insist on their saved 144 Hz mode find it, as on X11), and
+     *  reported as the refresh of every presentation feedback. Set before each session starts: the
+     *  compositor outlives sessions, and the next one may run the panel at another rate. */
     public static native void nativeSetOutputRefreshRate(float hz);
 
     /** Show a single fullscreen window on its own Android layer (SurfaceControl) instead of blitting
