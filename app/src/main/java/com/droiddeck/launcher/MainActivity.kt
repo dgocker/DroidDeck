@@ -908,6 +908,8 @@ class MainActivity : ComponentActivity() {
             com.droiddeck.launcher.frontend.GamesFolderMigration.run(this)
             SessionLogShare.clear(this)
             SessionArtifacts.finishAbandoned(this)
+            // Game launches an earlier app run never finished (it was killed, or the device went down).
+            com.droiddeck.launcher.diagnostics.DiagnosticsManager.recover()
             SessionArtifacts.scrubOlder(this)
             SessionArtifacts.prune(this)
         }, "finish-abandoned").start()

@@ -284,6 +284,12 @@ class SessionService : Service() {
     private fun collectSessionArtifacts(dir: File) {
         try {
             SessionArtifacts.collect(this, dir, "session stopped")
+            // Each game launch of the session gets its diagnostics folder while the logs are still here.
+            try {
+                com.droiddeck.launcher.diagnostics.DiagnosticsManager.sessionEnded(dir)
+            } catch (e: Exception) {
+                Log.w(TAG, "game diagnostics at session end", e)
+            }
         } finally {
             // Last, so everything above is in the file it is about - and only this session's:
             // a session that replaced this one may already own the capture and the folder.
@@ -376,6 +382,9 @@ class SessionService : Service() {
         guest.add("BL_REFRESH=" + Math.round(SessionState.refreshHz))
         guest.add("BL_LOG=" + sessionLog.path)
         guest.add("BL_DEBUG_DIR=" + sessionDir.path)
+        // Game diagnostics: where the guest's launchers record each game launch (droiddeck-game-diag).
+        guest.addAll(com.droiddeck.launcher.diagnostics.DiagnosticsManager.guestEnvironment(this))
+        com.droiddeck.launcher.diagnostics.DiagnosticsManager.sessionStarted(sessionDir)
 
         val fakeInputDir = File(sessionRoot, "dev/input").apply { mkdirs() }
         val controllersOn = !File(Environment.getExternalStorageDirectory(), NO_PAD_SWITCH).exists()

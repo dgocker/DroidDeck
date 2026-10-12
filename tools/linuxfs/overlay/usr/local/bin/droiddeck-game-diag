@@ -422,6 +422,7 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
             "started_boot_ns": started_boot,
             "boot_id": boot_id(),
             "wrapper_pid": os.getpid(),
+            "wrapper_start_time": start_time(os.getpid()),
             "child_pid": child.pid if child is not None else None,
             "child_start_time": start_time(child.pid) if child is not None else None,
             "program": os.path.basename(used[0][0]) if used else os.path.basename(command[0]),

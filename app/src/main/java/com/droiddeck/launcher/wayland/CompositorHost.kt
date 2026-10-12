@@ -66,6 +66,9 @@ object CompositorHost {
     @Volatile
     private var zeroCopy: Boolean? = null
 
+    /** Layer mode as last set for a session (null = not set in this process), for game diagnostics. */
+    val layerMode: Boolean? get() = zeroCopy
+
     /**
      * Layer mode on or off for the session about to start ([com.droiddeck.launcher.session.LayerMode]):
      * before the compositor starts it is the launch default, afterwards a live switch the compositor

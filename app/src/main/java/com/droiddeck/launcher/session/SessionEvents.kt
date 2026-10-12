@@ -56,6 +56,8 @@ object SessionEvents {
     }
 
     fun record(event: String, fields: Map<String, Any?> = emptyMap(), directory: File? = null) {
+        // Game diagnostics keep the session's lifecycle beside each launch; posting never waits.
+        if (directory == null) com.droiddeck.launcher.diagnostics.DiagnosticsManager.mirror(event, fields)
         val dir = directory ?: SessionState.logDirectory ?: SessionPaths.current() ?: return
         val target = if (directory == null) SessionState.eventsFile ?: File(dir, "events.jsonl")
             else File(dir, "events.jsonl")

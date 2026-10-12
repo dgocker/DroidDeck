@@ -83,6 +83,7 @@ class GameDiagTest(unittest.TestCase):
         self.assertEqual(start["launch_id"], end["launch_id"])
         self.assertTrue(start["launch_id"].startswith(time.strftime("%Y", time.gmtime())))
         self.assertIsInstance(start["started_boot_ns"], int)
+        self.assertEqual((start["wrapper_pid"], start["wrapper_start_time"]), (os.getpid(), DIAG["start_time"](os.getpid())))
         self.assertEqual((end["exited"], end["exit_code"], end["signal"], end["launch_failed"]), (True, 0, None, False))
         self.assertGreaterEqual(end["duration_ms"], 0)
         self.assertEqual(log[0][1]["close_fds"], False)

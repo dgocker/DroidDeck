@@ -24,6 +24,7 @@ object CrashHandler {
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             try {
                 Log.e(TAG, "uncaught on ${thread.name}", error)
+                com.droiddeck.launcher.diagnostics.DiagnosticsManager.crashed("uncaught on ${thread.name}: ${error.javaClass.name}")
                 val dir = SessionPaths.current()
                 if (dir != null && dir.isDirectory) {
                     val trace = StringWriter().also { error.printStackTrace(PrintWriter(it)) }.toString()
