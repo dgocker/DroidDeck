@@ -2291,7 +2291,7 @@
     <string name="diag_record">Record game launches</string>
     <string name="diag_record_hint">Each game launched in a session gets its own record when it ends. Takes effect at the next session.</string>
     <string name="diag_detail">Detail</string>
-    <string name="diag_detail_hint">How many events, and how much of each game's output, are kept</string>
+    <string name="diag_detail_hint">How many events, and how much of each game\'s output, are kept</string>
     <string name="diag_detail_minimal">Minimal</string>
     <string name="diag_detail_normal">Normal</string>
     <string name="diag_detail_verbose">Verbose</string>
@@ -2320,10 +2320,10 @@
     <string name="diag_export_failed">Export failed: %1$s</string>
     <string name="diag_delete">Delete</string>
     <string name="diag_delete_all">Delete all launches</string>
-    <string name="diag_delete_all_hint">Removes this game's records from the device</string>
+    <string name="diag_delete_all_hint">Removes this game\'s records from the device</string>
     <string name="diag_delete_launch">Delete this launch</string>
     <string name="diag_confirm_delete_title">Delete?</string>
-    <string name="diag_confirm_delete_launch">This launch's record and logs are removed from the device.</string>
+    <string name="diag_confirm_delete_launch">This launch\'s record and logs are removed from the device.</string>
     <string name="diag_confirm_delete_game">All %1$d launches of %2$s are removed from the device.</string>
     <string name="diag_group_outcome">Outcome</string>
     <string name="diag_status">Status</string>
@@ -2346,8 +2346,8 @@
     <string name="diag_status_lost">Lost when the session ended</string>
     <string name="diag_status_interrupted">Interrupted</string>
     <string name="diag_status_unknown">Unknown</string>
-    <string name="diag_certainty_confirmed">From the process's exit status</string>
-    <string name="diag_certainty_evidence">From a crash report in the game's output</string>
+    <string name="diag_certainty_confirmed">From the process\'s exit status</string>
+    <string name="diag_certainty_evidence">From a crash report in the game\'s output</string>
     <string name="diag_certainty_ambiguous">The status has more than one possible cause</string>
     <string name="diag_certainty_inferred">Inferred: the exit was not recorded</string>
 </resources>
