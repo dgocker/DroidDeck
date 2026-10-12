@@ -9,6 +9,10 @@ line by line. Lines starting with '#' (CPUID, information) are not compared.
     python3 tools/fexdiff/run.py --translator "qemu-aarch64-static -L /usr/aarch64-linux-gnu -cpu max,sve=off,sme=off build/Bin/FEX" \
         --env FEX_HOSTFEATURES=disablelrcpc2 --out /tmp/fexdiff
 
+Under qemu, the emulated CPU decides which of the translator's code paths run: pin it (QEMU_CPU) to
+the host being stood in for - "max,sve=off,sme=off" for a CPU without SVE (Oryon), or
+"max,sme=off,sve-default-vector-length=16" for SVE2 at 128 bits (Cortex-X/A7xx). summary.txt names it.
+
 Exit status: 0 when every section matches, 1 when any differs or fails.
 """
 
@@ -81,7 +85,8 @@ def main(argv: list[str]) -> int:
         env[name] = value
     translator = shlex.split(args.translator)
     failed = False
-    summary = []
+    summary = ["# translator: %s" % args.translator,
+               "# env: %s" % " ".join(args.env + ["QEMU_CPU=%s" % os.environ.get("QEMU_CPU", "")])]
     for section in args.sections.split(","):
         rc_n, native, _, t_n = run([str(binary), section], dict(os.environ), args.timeout)
         rc_t, translated, err, t_t = run(translator + [str(binary), section], env, args.timeout)

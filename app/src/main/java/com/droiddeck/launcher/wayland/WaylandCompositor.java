@@ -468,6 +468,9 @@ public final class WaylandCompositor {
      *  the CPU has none. */
     public static native long nativeCounterFrequency();
 
+    /** The SVE vector length in bits, as prctl(PR_SVE_GET_VL) gives it; 0 without SVE. */
+    public static native int nativeSveVectorBits();
+
     /** Inject the app's X-server input in scene (virtual desktop) pixels. type 2 = move to a,b;
      *  3 = evdev button a (BTN_LEFT=0x110…) pressed (b=1) or released (b=0); 4 = a wheel steps,
      *  negative = up. */

@@ -387,7 +387,8 @@ object DiagnosticsManager {
         "page_size" to try { android.system.Os.sysconf(android.system.OsConstants._SC_PAGESIZE) } catch (e: Exception) { null },
         "abis" to Build.SUPPORTED_ABIS.toList(),
         "counter_hz" to try { com.droiddeck.launcher.wayland.WaylandCompositor.nativeCounterFrequency().takeIf { it > 0 } } catch (t: Throwable) { null },
-    )
+        "sve_vector_bits" to try { com.droiddeck.launcher.wayland.WaylandCompositor.nativeSveVectorBits() } catch (t: Throwable) { null },
+    ) + cpuFacts(try { File("/proc/cpuinfo").readText() } catch (e: Exception) { "" })
 
     private fun buildInfo(): Map<String, Any?> = mapOf(
         "version_name" to BuildConfig.VERSION_NAME,
@@ -411,4 +412,16 @@ object DiagnosticsManager {
             Log.w(TAG, "$what failed", t)
         }
     }
+}
+
+/**
+ * What /proc/cpuinfo says about the CPU that decides FEX's code paths: the kernel's feature flags
+ * (lrcpc/ilrcpc, uscat, atomics, sve2, afp, flagm...) and each distinct implementer:part pair.
+ */
+internal fun cpuFacts(cpuinfo: String): Map<String, Any?> {
+    val lines = cpuinfo.lines()
+    fun values(key: String) = lines.filter { it.substringBefore(':').trim() == key }.map { it.substringAfter(':').trim() }
+    val features = values("Features").firstOrNull()?.split(Regex("\\s+"))?.filter { it.isNotEmpty() }
+    val parts = values("CPU implementer").zip(values("CPU part")) { i, p -> "$i:$p" }.distinct()
+    return mapOf("cpu_features" to features, "cpu_parts" to parts.ifEmpty { null })
 }

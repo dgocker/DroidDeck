@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <android/log.h>
 #include <android/native_window_jni.h>
@@ -715,6 +716,19 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCounterFrequency(JNI
 #else
     return 0;
 #endif
+}
+
+#ifndef PR_SVE_GET_VL
+#define PR_SVE_GET_VL 51
+#endif
+
+/* The SVE vector length new threads get, in bits: FEX picks its SVE code paths by it. 0 where the
+ * CPU or kernel has no SVE (the call then fails with EINVAL). */
+JNIEXPORT jint JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSveVectorBits(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    int vl = prctl(PR_SVE_GET_VL, 0, 0, 0, 0);
+    return vl < 0 ? 0 : (jint)(vl & 0xffff) * 8;
 }
 
 /* Raises one of our own processes or threads to `nice` with a bare setpriority(), never lowering
