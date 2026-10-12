@@ -383,8 +383,9 @@ class SessionService : Service() {
         guest.add("BL_LOG=" + sessionLog.path)
         guest.add("BL_DEBUG_DIR=" + sessionDir.path)
         // Game diagnostics: where the guest's launchers record each game launch (droiddeck-game-diag).
-        guest.addAll(com.droiddeck.launcher.diagnostics.DiagnosticsManager.guestEnvironment(this))
-        com.droiddeck.launcher.diagnostics.DiagnosticsManager.sessionStarted(sessionDir)
+        val diagnostics = com.droiddeck.launcher.diagnostics.DiagnosticsManager.guestEnvironment(this)
+        guest.addAll(diagnostics)
+        if (diagnostics.isNotEmpty()) com.droiddeck.launcher.diagnostics.DiagnosticsManager.sessionStarted(sessionDir)
 
         val fakeInputDir = File(sessionRoot, "dev/input").apply { mkdirs() }
         val controllersOn = !File(Environment.getExternalStorageDirectory(), NO_PAD_SWITCH).exists()

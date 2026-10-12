@@ -174,10 +174,10 @@ object DiagnosticsManager {
         }
     }
 
-    /** Launches started and not finished yet, for the history screen. */
+    /** Launches started that have not ended, for the history screen; one that ended shows up once its folder is made. */
     fun pending(): List<LaunchRecords.Start> {
         val s = store ?: return emptyList()
-        return LaunchRecords.all(s.inbox).mapNotNull { it.start() }
+        return LaunchRecords.all(s.inbox).filter { !it.exitFile.exists() }.mapNotNull { it.start() }
     }
 
     /** Runs [work] on the diagnostics thread, then [done] on it with the result. */
