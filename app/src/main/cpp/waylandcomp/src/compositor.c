@@ -54,6 +54,7 @@
 #include "droiddeck_color.h"
 #include "compositor_internal.h"
 #include "frame_stats.h"
+#include "input_queue.h"
 
 #define WLOGI(...) __android_log_print(ANDROID_LOG_INFO, "DroidDeckWayland", __VA_ARGS__)
 #define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, "DroidDeckWayland", __VA_ARGS__)
@@ -572,8 +573,8 @@ static void touch_cancel_surface(struct surface *surface);
 static struct surface *g_grab;              /* no-desktop fallback: surface holding the button */
 static struct surface *g_key_target;        /* no-desktop fallback: last clicked surface */
 static struct surface *g_ime_click;         /* last clicked program window: where text input goes */
-static int g_input_pipe[2] = {-1, -1};
-struct input_msg { int type; int p1; int p2; int p3; int p4; };
+/* Input and vsync ticks from the app's threads (input_queue.h: ordered, nothing lost silently). */
+static struct input_queue g_inq = INPUT_QUEUE_INIT;
 
 /* Pointer constraints (zwp_pointer_constraints_v1) and relative pointers
  * (zwp_relative_pointer_manager_v1); see the "pointer constraints" section. */
@@ -3267,73 +3268,63 @@ static void output_resized(void) {
     wl_display_flush_clients(g_display);
 }
 
-/* wl event-loop callback: drain queued input events written by the Android UI thread. */
-static int on_input_readable(int fd, uint32_t mask, void *data) {
-    struct input_msg m;
-    while (read(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) {
-        switch (m.type) {
-        case 1: deliver_key(&m); break;
-        case 2: pointer_event(m.p1, m.p2, 0, 0); break;          /* scene motion */
-        case 3: pointer_button(m.p1, m.p2); break;               /* button at pointer */
-        case 4: scroll_event(m.p1); break;
-        case 5: on_vsync(((int64_t)m.p1 << 32) | (uint32_t)m.p2); break;
-        case 6: pointer_delta(m.p1 / 256.0, m.p2 / 256.0); break; /* relative motion, 1/256 px */
-        case 7: deliver_touch(&m); break;
-        case 8: output_resized(); break;
-        default: deliver_pointer(&m); break;
-        }
+static void dispatch_input(const struct input_msg *m, void *ctx) {
+    (void)ctx;
+    switch (m->type) {
+    case INPUT_KEY: deliver_key(m); break;
+    case INPUT_SCENE_MOTION: pointer_event(m->p1, m->p2, 0, 0); break;
+    case INPUT_BUTTON: pointer_button(m->p1, m->p2); break;            /* button at pointer */
+    case INPUT_WHEEL: scroll_event(m->p1); break;
+    case INPUT_VSYNC: on_vsync(((int64_t)m->p1 << 32) | (uint32_t)m->p2); break;
+    case INPUT_RELATIVE: pointer_delta(m->p1 / 256.0, m->p2 / 256.0); break; /* 1/256 px */
+    case INPUT_TOUCH: deliver_touch(m); break;
+    case INPUT_RESIZED: output_resized(); break;
+    default: deliver_pointer(m); break;
     }
+}
+
+/* wl event-loop callback: deliver the input and ticks the app's threads queued, in order. */
+static int on_input_readable(int fd, uint32_t mask, void *data) {
+    input_queue_drain(&g_inq, dispatch_input, NULL);
     return 0;
 }
 
 /* Called from JNI (Android UI thread). Queues a pointer event; the compositor thread
  * dispatches it. x/y are in INPUT_SPACE (0..1919, 0..1079) over the whole output. */
 void droiddeck_wayland_send_pointer(int action, int x, int y) {
-    if (g_input_pipe[1] < 0) return;
-    struct input_msg m = { 0, action, x, y, 0 };
-    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
-    (void)n;
+    struct input_msg m = { INPUT_POINTER, action, x, y, 0 };
+    input_queue_push(&g_inq, &m);
 }
 
 void droiddeck_wayland_send_touch(int action, int pointer_id, int x, int y) {
-    if (g_input_pipe[1] < 0) return;
-    struct input_msg m = { 7, action, pointer_id, x, y };
-    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
-    (void)n;
+    struct input_msg m = { INPUT_TOUCH, action, pointer_id, x, y };
+    input_queue_push(&g_inq, &m);
 }
 
 /* Called from JNI. Queues a key event. evdev = Linux input keycode (e.g. KEY_A=30); state 1=down 0=up. */
 void droiddeck_wayland_send_key(int evdev, int state) {
-    if (g_input_pipe[1] < 0) return;
-    struct input_msg m = { 1, evdev, state, 0, 0 };
-    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
-    (void)n;
+    struct input_msg m = { INPUT_KEY, evdev, state, 0, 0 };
+    input_queue_push(&g_inq, &m);
 }
 
 /* Called from JNI after g_output_w/h changed: the compositor thread re-sends the size. */
 void droiddeck_wayland_output_resized(void) {
-    if (g_input_pipe[1] < 0) return;
-    struct input_msg m = { 8, 0, 0, 0, 0 };
-    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
-    (void)n;
+    struct input_msg m = { INPUT_RESIZED, 0, 0, 0, 0 };
+    input_queue_push(&g_inq, &m);
 }
 
 /* Called from JNI on every screen refresh (Choreographer). */
 void droiddeck_wayland_vsync(int64_t frame_time_ns) {
-    if (g_input_pipe[1] < 0) return;
-    struct input_msg m = { 5, (int)(frame_time_ns >> 32), (int)(uint32_t)frame_time_ns, 0, 0 };
-    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
-    (void)n;
+    struct input_msg m = { INPUT_VSYNC, (int)(frame_time_ns >> 32), (int)(uint32_t)frame_time_ns, 0, 0 };
+    input_queue_push(&g_inq, &m);
 }
 
 /* Called from JNI with the app's X-server input (on-screen controls, mouse): type 2 = motion
  * to scene x,y; 3 = evdev button a pressed/released (b); 4 = a wheel steps (negative = up);
  * 6 = relative motion by a,b in 1/256 pixel (the app's Relative Mouse / captured-mouse path). */
 void droiddeck_wayland_send_scene_input(int type, int a, int b) {
-    if (g_input_pipe[1] < 0) return;
     struct input_msg m = { type, a, b, 0, 0 };
-    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
-    (void)n;
+    input_queue_push(&g_inq, &m);
 }
 
 /* ------------------------------------------------------------------ extension module hooks
@@ -3430,6 +3421,15 @@ static int on_stats_timer(void *data) {
                    frame_hist_ms(v, 50), frame_hist_ms(v, 95), frame_hist_ms(v, 99), (double)v->max_ns / 1e6,
                    frame_hist_at_least(v, 2.0 * frame_hist_ms(v, 50)),
                    frame_hist_ms(l, 50), frame_hist_ms(l, 95), (double)l->max_ns / 1e6);
+    }
+    /* Input that found the pipe full (the compositor thread was busy): only when there was any. */
+    {
+        struct input_stats is;
+        input_queue_stats_take(&g_inq, &is);
+        if (is.queued || is.merged || is.dropped || is.ticks_merged)
+            droiddeck_log(is.dropped ? "error" : "input", "last 10 s: the input pipe was full: %u events queued behind it, "
+                       "%u moves merged, %u dropped (overflow full), %u vsync ticks merged",
+                       is.queued, is.merged, is.dropped, is.ticks_merged);
     }
     frame_hist_window(&g_pace_commit);
     frame_hist_window(&g_pace_shown);
@@ -3597,11 +3597,11 @@ int droiddeck_wayland_run(void) {
         g_release_source = wl_event_loop_add_fd(wl_display_get_event_loop(display), g_release_timer_fd,
                                                 WL_EVENT_READABLE, on_release_timer, NULL);
 
-    /* Input injection: the Android UI thread writes events to g_input_pipe[1];
-     * the wl event loop drains them on this thread. */
+    /* Input injection: the app's threads queue events (input_queue.h); the wl event loop drains
+     * them on this thread. */
     g_display = display;
-    if (pipe2(g_input_pipe, O_CLOEXEC | O_NONBLOCK) == 0) {
-        wl_event_loop_add_fd(wl_display_get_event_loop(display), g_input_pipe[0],
+    if (input_queue_open(&g_inq) == 0) {
+        wl_event_loop_add_fd(wl_display_get_event_loop(display), g_inq.rfd,
                              WL_EVENT_READABLE, on_input_readable, NULL);
     } else {
         WLOGE("input pipe creation failed");
