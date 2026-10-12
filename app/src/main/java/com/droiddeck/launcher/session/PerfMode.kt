@@ -31,20 +31,20 @@ object PerfMode {
     fun apply(a: Activity, fpsLimit: Int = 0): String {
         val parts = ArrayList<String>(2)
 
-        // The fastest display mode at the panel's current size.
+        // The fastest display mode at the panel's current size that the cap divides (DisplayModePolicy).
         parts += try {
             val display = if (Build.VERSION.SDK_INT >= 30) a.display else @Suppress("DEPRECATION") a.windowManager.defaultDisplay
             if (display == null || Build.VERSION.SDK_INT < 23) "display mode unchanged" else {
-                val cur = display.mode
-                val sameSize = display.supportedModes
-                    .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
-                val best = sameSize.filter { cadenceFits(it.refreshRate, fpsLimit) }.maxByOrNull { it.refreshRate }
-                    ?: sameSize.maxByOrNull { it.refreshRate }
-                if (best != null && best.modeId != cur.modeId &&
-                    (best.refreshRate > cur.refreshRate + 0.5f || !cadenceFits(cur.refreshRate, fpsLimit))) {
-                    a.window.attributes = a.window.attributes.apply { preferredDisplayModeId = best.modeId }
-                    "display ${cur.refreshRate.toInt()} → ${best.refreshRate.toInt()} Hz (mode ${best.modeId})"
-                } else "display ${cur.refreshRate.toInt()} Hz"
+                fun mode(m: android.view.Display.Mode) =
+                    DisplayModePolicy.Mode(m.modeId, m.physicalWidth, m.physicalHeight, m.refreshRate)
+                val cur = mode(display.mode)
+                val modes = display.supportedModes.map { mode(it) }
+                val cap = if (fpsLimit > 0) ", cap $fpsLimit fps" else ", no cap"
+                val best = DisplayModePolicy.pick(modes, cur, fpsLimit)
+                if (best != null) {
+                    a.window.attributes = a.window.attributes.apply { preferredDisplayModeId = best.id }
+                    "display ${cur.hz.toInt()} → ${best.hz.toInt()} Hz (mode ${best.id}; offers ${DisplayModePolicy.describe(modes, cur)}$cap)"
+                } else "display ${cur.hz.toInt()} Hz (offers ${DisplayModePolicy.describe(modes, cur)}$cap)"
             }
         } catch (t: Throwable) { Log.w(TAG, "display mode", t); "display mode failed" }
 
@@ -69,9 +69,5 @@ object PerfMode {
     }
 
     /** A panel rate that shows every capped frame for a whole number of refreshes (no cap: any). */
-    fun cadenceFits(hz: Float, fpsLimit: Int): Boolean {
-        if (fpsLimit <= 0) return true
-        val ratio = hz / fpsLimit
-        return ratio >= 0.98f && Math.abs(ratio - Math.round(ratio)) < 0.02f
-    }
+    fun cadenceFits(hz: Float, fpsLimit: Int): Boolean = DisplayModePolicy.cadenceFits(hz, fpsLimit)
 }
