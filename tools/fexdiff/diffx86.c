@@ -608,6 +608,28 @@ __attribute__((target("avx2,fma,f16c"))) static void test_avx(void) {
   P256("vcmpps_nge_uq", _mm256_castps_si256(_mm256_cmp_ps(x, n, _CMP_NGE_UQ)));
   printf("avx.vptest %d %d vtestps %d\n", _mm256_testz_si256(a, b), _mm256_testc_si256(a, b), _mm256_testz_ps(x, n));
   printf("avx.vmovmskps %x vpmovmskb %08x\n", _mm256_movemask_ps(n), (uint32_t)_mm256_movemask_epi8(a));
+  // 128-bit operations on registers whose upper 128 bits hold other data: a translator that works on
+  // whole host vector registers wider than 128 bits must not take those bits in. The legacy-SSE form
+  // keeps the upper half, the VEX.128 form zeroes it, vcvtdq2pd ymm widens the low 128 bits only.
+  int32_t lanes[3][8];
+  __asm__ volatile(
+      "vmovdqu (%3), %%ymm0\n\tvmovdqu 32(%3), %%ymm1\n\t"
+      "pmaddubsw %%xmm1, %%xmm0\n\t"
+      "vmovdqu %%ymm0, (%0)\n\t"
+      "vmovdqu (%3), %%ymm2\n\tvmovdqu 32(%3), %%ymm3\n\t"
+      "vpmaddubsw %%xmm3, %%xmm2, %%xmm2\n\t"
+      "vmovdqu %%ymm2, (%1)\n\t"
+      "vmovdqu 32(%3), %%ymm4\n\t"
+      "vcvtdq2pd %%xmm4, %%ymm5\n\t"
+      "vmovdqu %%ymm5, (%2)\n\t"
+      : : "r"(lanes[0]), "r"(lanes[1]), "r"(lanes[2]), "r"(src)
+      : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
+  for (int t = 0; t < 3; t++) {
+    static const char *const names[] = {"pmaddubsw_keeps_upper", "vpmaddubsw_xmm", "vcvtdq2pd_ymm"};
+    printf("avx.lanes.%s", names[t]);
+    for (int k = 7; k >= 0; k--) printf(" %08x", (uint32_t)lanes[t][k]);
+    printf("\n");
+  }
 #undef P256
 }
 
@@ -654,7 +676,7 @@ static void test_x87(void) {
   for (int i = 9; i >= 0; i--) printf(" %02x", out[i]);
   printf("\n");
   // Rounding control on frndint and fistp, and integer indefinite on overflow.
-  const double ins[] = {2.5, 3.5, -2.5, -0.5, 1e20, -1e20, 0.49999999999999994, NAN};
+  const double ins[] = {2.5, 3.5, -2.5, -0.5, 1e20, -1e20, 0.49999999999999994, NAN, 40000.5, -3e9};
   for (int rc = 0; rc < 4; rc++) {
     uint16_t cw = (uint16_t)(0x037f | rc << 10);
     for (size_t i = 0; i < sizeof(ins) / sizeof(ins[0]); i++) {
@@ -664,7 +686,16 @@ static void test_x87(void) {
       __asm__ volatile("fninit\n\tfldcw %3\n\tfldl %2\n\tfrndint\n\tfstpl %0\n\tfldl %2\n\tfistpll %1"
                        : "=m"(r), "=m"(q) : "m"(ins[i]), "m"(cw) : "memory");
       __asm__ volatile("fninit\n\tfldcw %2\n\tfldl %1\n\tfistpl %0" : "=m"(q32) : "m"(ins[i]), "m"(cw) : "memory");
-      printf("x87.round rc=%d %016" PRIx64 " frndint=%016" PRIx64 " fistp64=%016" PRIx64 " fistp32=%08x\n", rc, bits_d(ins[i]), bits_d(r), (uint64_t)q, (uint32_t)q32);
+      int16_t q16, t16;
+      int32_t t32;
+      int64_t t64;
+      __asm__ volatile("fninit\n\tfldcw %2\n\tfldl %1\n\tfistps %0" : "=m"(q16) : "m"(ins[i]), "m"(cw) : "memory");
+      // fisttp (SSE3) truncates whatever the rounding control says.
+      __asm__ volatile("fninit\n\tfldcw %4\n\tfldl %3\n\tfisttpll %0\n\tfldl %3\n\tfisttpl %1\n\tfldl %3\n\tfisttps %2"
+                       : "=m"(t64), "=m"(t32), "=m"(t16) : "m"(ins[i]), "m"(cw) : "memory");
+      printf("x87.round rc=%d %016" PRIx64 " frndint=%016" PRIx64 " fistp64=%016" PRIx64 " fistp32=%08x fistp16=%04x"
+             " fisttp64=%016" PRIx64 " fisttp32=%08x fisttp16=%04x\n", rc, bits_d(ins[i]), bits_d(r), (uint64_t)q, (uint32_t)q32,
+             (uint16_t)q16, (uint64_t)t64, (uint32_t)t32, (uint16_t)t16);
     }
   }
   __asm__ volatile("fninit");

@@ -1,0 +1,251 @@
+From: DroidDeck FEX audit <noreply@anthropic.com>
+Subject: [PATCH 2/2] X87F64: store the integer indefinite from FIST/FISTP/FISTTP
+
+With X87ReducedPrecision (Proton's FEX_Config.json sets it), FISTF64 used
+Arm's conversions directly. They saturate and turn NaN into 0, where x86
+stores the integer indefinite (the destination's most negative value) for
+NaN and for anything out of the destination's range:
+
+  fistp qword 1.0e20     0x7fffffffffffffff, x86 0x8000000000000000
+  fistp dword NaN        0x00000000,         x86 0x80000000
+  fistp word 40000.5     0x9c40,             x86 0x8000
+  (fisttp the same)
+
+The 80-bit path already gets this right. Use the fix-ups CVTFPR_To_GPRImpl
+uses for CVT*2SI: FRINT{32,64}{X,Z} where FRINTTS is there (out of range and
+NaN give the most negative value, which converts to the indefinite), a
+compare-and-select otherwise, and a range check for the 16-bit form. The
+64-bit store keeps its FPR path when FRINTTS is there.
+
+Tests: X87_F64/FIST_Indefinite_F64.asm fails before and passes after, on
+hosts with and without FRINTTS (qemu -cpu max and neoverse-n1);
+X87/FIST_Indefinite.asm is the same test for the 80-bit path, which passes
+before and after.
+
+---
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+index 33fba6901..611642ec7 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+@@ -105,21 +105,33 @@ void OpDispatchBuilder::FILDF64(OpcodeArgs) {
+ void OpDispatchBuilder::FISTF64(OpcodeArgs, bool Truncate) {
+   const auto Size = OpSizeFromSrc(Op);
+ 
++  // x86 stores the integer indefinite (the destination's most negative value) for NaN and for anything out of the
++  // destination's range. Arm's conversions saturate and turn NaN into 0, so they need the same fix-ups as CVT*2SI.
+   Ref data = _ReadStackValue(0);
+-  bool CanUseFloatReg = Size == OpSize::i64Bit;
++  bool CanUseFloatReg = Size == OpSize::i64Bit && CTX->HostFeatures.SupportsFRINTTS;
+   if (CanUseFloatReg) {
+     // If possible, it's faster to keep the data in an FPR than doing a GPR transfer.
+-    if (Truncate) {
+-      data = _Vector_FToZS(OpSize::i128Bit, OpSize::i64Bit, data);
+-    } else {
+-      data = _Vector_FToS(OpSize::i128Bit, OpSize::i64Bit, data);
+-    }
++    // FRINT64{X,Z} give -2^63 for NaN and out of range values, which converts to the indefinite.
++    data = _Vector_FToISized(OpSize::i64Bit, OpSize::i64Bit, data, !Truncate, OpSize::i64Bit);
++    data = _Vector_FToZS(OpSize::i128Bit, OpSize::i64Bit, data);
+     StoreResultFPR_WithOpSize(Op, Op->Dest, data, OpSize::i64Bit, OpSize::i8Bit);
+   } else {
+-    if (Truncate) {
+-      data = _Float_ToGPR_ZS(Size == OpSize::i32Bit ? OpSize::i32Bit : OpSize::i64Bit, OpSize::i64Bit, data);
++    const auto GPRSize = Size == OpSize::i64Bit ? OpSize::i64Bit : OpSize::i32Bit;
++    if (CTX->HostFeatures.SupportsFRINTTS) {
++      data = _Vector_FToISized(OpSize::i64Bit, OpSize::i64Bit, data, !Truncate, GPRSize);
++      data = _Float_ToGPR_ZS(GPRSize, OpSize::i64Bit, data);
+     } else {
+-      data = _Float_ToGPR_S(Size == OpSize::i32Bit ? OpSize::i32Bit : OpSize::i64Bit, OpSize::i64Bit, data);
++      if (!Truncate) {
++        data = _Vector_FToI(OpSize::i64Bit, OpSize::i64Bit, data, RoundMode::Host);
++      }
++      Ref Converted = _Float_ToGPR_ZS(GPRSize, OpSize::i64Bit, data);
++      Ref MinI = GPRSize == OpSize::i32Bit ? Constant(0x80000000) : Constant(0x8000000000000000);
++      Ref MaxF = LoadAndCacheNamedVectorConstant(OpSize::i64Bit, GPRSize == OpSize::i32Bit ? NAMED_VECTOR_CVTMAX_F64_I32 : NAMED_VECTOR_CVTMAX_F64_I64);
++      data = _Select(GPRSize, OpSize::i64Bit, CondClass::FGT, MaxF, data, Converted, MinI);
++    }
++    if (Size == OpSize::i16Bit) {
++      // In range for 32 bits but not for 16: the 16-bit indefinite.
++      data = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ, _Sbfe(OpSize::i32Bit, 16, 0, data), data, data, Constant(0x8000));
+     }
+     StoreResultGPR_WithOpSize(Op, Op->Dest, data, Size, OpSize::i8Bit,
+                               CTX->IsVectorAtomicTSOEnabled() ? MemoryAccessType::DEFAULT : MemoryAccessType::NONTSO);
+diff --git a/unittests/ASM/X87_F64/FIST_Indefinite_F64.asm b/unittests/ASM/X87_F64/FIST_Indefinite_F64.asm
+new file mode 100644
+index 000000000..638b9f097
+--- /dev/null
++++ b/unittests/ASM/X87_F64/FIST_Indefinite_F64.asm
+@@ -0,0 +1,84 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0x8000000000000000",
++    "RBX": "0x8000000000000000",
++    "RCX": "0x80000000",
++    "RDX": "0x80000000",
++    "RSI": "0x8000",
++    "RDI": "0x8000",
++    "R8":  "0x8000",
++    "R9":  "0x8000000000000000",
++    "R10": "0x80000000",
++    "R11": "0x8000",
++    "R12": "0xfffe",
++    "R13": "0xfffffffe"
++  },
++  "Env": { "FEX_X87REDUCEDPRECISION" : "1" }
++}
++%endif
++
++; x86 stores the integer indefinite, the most negative value of the destination's size, for NaN and for
++; anything out of the destination's range: fist, fistp and fisttp alike, at every size.
++lea rbp, [rel .data]
++mov r15, 0xe0000000
++
++fld qword [rbp]
++fistp qword [r15]
++mov rax, [r15]
++
++fld qword [rbp + 8]
++fistp qword [r15]
++mov rbx, [r15]
++
++fld qword [rbp]
++fistp dword [r15]
++mov ecx, [r15]
++
++fld qword [rbp + 8]
++fist dword [r15]
++fstp st0
++mov edx, [r15]
++
++fld qword [rbp + 16]
++fistp word [r15]
++movzx esi, word [r15]
++
++fld qword [rbp + 24]
++fistp word [r15]
++movzx edi, word [r15]
++
++fld qword [rbp + 8]
++fistp word [r15]
++movzx r8d, word [r15]
++
++fld qword [rbp]
++fisttp qword [r15]
++mov r9, [r15]
++
++fld qword [rbp]
++fisttp dword [r15]
++mov r10d, [r15]
++
++fld qword [rbp + 16]
++fisttp word [r15]
++movzx r11d, word [r15]
++
++; In range values are unaffected: round to nearest even, and truncation.
++fld qword [rbp + 32]
++fistp word [r15]
++movzx r12d, word [r15]
++
++fld qword [rbp + 32]
++fisttp dword [r15]
++mov r13d, [r15]
++
++hlt
++
++align 8
++.data:
++dq 0x4415AF1D78B58C40 ; 1.0e20
++dq 0x7FF8000000000000 ; NaN
++dq 0x40E3881000000000 ; 40000.5
++dq 0xC1E65A0BC0000000 ; -3.0e9
++dq 0xC004000000000000 ; -2.5
+diff --git a/unittests/ASM/X87/FIST_Indefinite.asm b/unittests/ASM/X87/FIST_Indefinite.asm
+new file mode 100644
+index 000000000..50b2ebd0c
+--- /dev/null
++++ b/unittests/ASM/X87/FIST_Indefinite.asm
+@@ -0,0 +1,83 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0x8000000000000000",
++    "RBX": "0x8000000000000000",
++    "RCX": "0x80000000",
++    "RDX": "0x80000000",
++    "RSI": "0x8000",
++    "RDI": "0x8000",
++    "R8":  "0x8000",
++    "R9":  "0x8000000000000000",
++    "R10": "0x80000000",
++    "R11": "0x8000",
++    "R12": "0xfffe",
++    "R13": "0xfffffffe"
++  }
++}
++%endif
++
++; x86 stores the integer indefinite, the most negative value of the destination's size, for NaN and for
++; anything out of the destination's range: fist, fistp and fisttp alike, at every size.
++lea rbp, [rel .data]
++mov r15, 0xe0000000
++
++fld qword [rbp]
++fistp qword [r15]
++mov rax, [r15]
++
++fld qword [rbp + 8]
++fistp qword [r15]
++mov rbx, [r15]
++
++fld qword [rbp]
++fistp dword [r15]
++mov ecx, [r15]
++
++fld qword [rbp + 8]
++fist dword [r15]
++fstp st0
++mov edx, [r15]
++
++fld qword [rbp + 16]
++fistp word [r15]
++movzx esi, word [r15]
++
++fld qword [rbp + 24]
++fistp word [r15]
++movzx edi, word [r15]
++
++fld qword [rbp + 8]
++fistp word [r15]
++movzx r8d, word [r15]
++
++fld qword [rbp]
++fisttp qword [r15]
++mov r9, [r15]
++
++fld qword [rbp]
++fisttp dword [r15]
++mov r10d, [r15]
++
++fld qword [rbp + 16]
++fisttp word [r15]
++movzx r11d, word [r15]
++
++; In range values are unaffected: round to nearest even, and truncation.
++fld qword [rbp + 32]
++fistp word [r15]
++movzx r12d, word [r15]
++
++fld qword [rbp + 32]
++fisttp dword [r15]
++mov r13d, [r15]
++
++hlt
++
++align 8
++.data:
++dq 0x4415AF1D78B58C40 ; 1.0e20
++dq 0x7FF8000000000000 ; NaN
++dq 0x40E3881000000000 ; 40000.5
++dq 0xC1E65A0BC0000000 ; -3.0e9
++dq 0xC004000000000000 ; -2.5

@@ -1,0 +1,39 @@
+From: DroidDeck FEX audit <noreply@anthropic.com>
+Subject: [PATCH 1/2] HostFeatures: only take the SVE128 paths when SVE vectors are 128 bits wide
+
+OverrideFeatures() turns SupportsSVE256 off unless ForceSVEWidth asks for it,
+while SupportsSVE128 stays on for any SVE2 host. The SVE128 paths operate on
+whole Z registers (uunpkhi/sunpkhi, gathers, wide shifts) and are only right
+when those are 128 bits wide: on a host with longer vectors they take in the
+upper lanes too.
+
+Reproduced under qemu-aarch64 8.2.2 with -cpu max,sme=off and
+sve-default-vector-length=32 or 64, FEX-2610 (14c92681f):
+  pmaddubsw xmm0, xmm1        upper four words come out 0
+  vcvtdq2pd ymm2, xmm2        upper two doubles come from the wrong lane
+  unittests/ASM/VEX/vcvtdq2pd.asm fails; passes at sve-default-vector-length=16
+With this change those match an x86-64 host at 128, 256 and 512 bits.
+
+Hosts with SVE2 at 128 bits (Cortex-X2..X925, Neoverse N2/V2) are unchanged.
+The Windows frontends never enable SVE and are unaffected.
+
+---
+diff --git a/Source/Common/HostFeatures.cpp b/Source/Common/HostFeatures.cpp
+index 858d76d71..0dd576683 100644
+--- a/Source/Common/HostFeatures.cpp
++++ b/Source/Common/HostFeatures.cpp
+@@ -597,6 +597,14 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
+ 
+   HandleErrata(&HostFeatures, MIDR);
+   OverrideFeatures(&HostFeatures, ForceSVEWidth());
++
++#ifndef VIXL_SIMULATOR
++  // The SVE128 paths work on whole Z registers, which is only right when they are 128 bits wide. On a
++  // wider host without the SVE256 paths enabled they would also take in the upper lanes; use ASIMD there.
++  if (HostFeatures.SupportsSVE128 && !HostFeatures.SupportsSVE256 && Features.GetSVEVectorLengthInBits() != 128) {
++    HostFeatures.SupportsSVE128 = false;
++  }
++#endif
+ }
+ 
+ FEXCore::HostFeatures FetchHostFeatures() {
