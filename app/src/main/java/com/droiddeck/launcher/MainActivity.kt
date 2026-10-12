@@ -725,6 +725,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }, "clear-logs").start()
                         },
+                        onGameDiagnostics = { startActivity(Intent(this, com.droiddeck.launcher.diagnostics.DiagnosticsActivity::class.java)) },
                         onOffline = {
                             OfflineMode.setEnabled(this, !OfflineMode.enabled(this))
                             offline = OfflineMode.enabled(this)

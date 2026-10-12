@@ -205,6 +205,7 @@ class FrontEndActions(
     val onAgentCommands: () -> Unit = {},
     val onShareLogs: () -> Unit = {},
     val onClearLogs: () -> Unit = {},
+    val onGameDiagnostics: () -> Unit = {},
     val onOffline: () -> Unit,
     val onPageBack: () -> Unit = {},
     val onTheme: (String) -> Unit = {},
