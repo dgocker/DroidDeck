@@ -53,6 +53,7 @@
 #include "droiddeck_ext.h"
 #include "droiddeck_color.h"
 #include "compositor_internal.h"
+#include "frame_stats.h"
 
 #define WLOGI(...) __android_log_print(ANDROID_LOG_INFO, "DroidDeckWayland", __VA_ARGS__)
 #define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, "DroidDeckWayland", __VA_ARGS__)
@@ -767,6 +768,13 @@ static struct surface *g_hud_surface;
 static int64_t g_hud_last_ns;
 /* That window committed a frame the screen has not drawn yet. */
 static int g_hud_fresh;
+/* The 10 s `pacing` line (on_stats_timer, frame_stats.h), for the HUD's window - the game, as the HUD
+ * counts it: the intervals between its commits, the intervals between the scenes that put a NEW one of
+ * its frames on screen (the unique frames shown, whatever the refresh rate), and how long the frame a
+ * scene showed had waited from its commit to the compositor's present. Compositor thread only. */
+static struct frame_hist g_pace_commit, g_pace_shown, g_pace_latency;
+static unsigned g_pace_commits, g_pace_shows;
+static int64_t g_hud_commit_ns;         /* the HUD window's latest commit */
 extern void droiddeck_on_game_surface(const char *window, const char *gpu); /* window NULL = gone */
 extern void droiddeck_on_game_frame(void);
 /* The program behind that window: its Linux pid (the Wayland client's credentials) and executable name
@@ -869,7 +877,14 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
      * Asking whether the compositor could import it, as this used to, is a question about the
      * copy path and not about whether a frame happened: a game whose buffers go straight to
      * the display layer draws on screen while the counter sat at 0.0 fps and 1000.0 ms. */
-    if (s == g_hud_surface) { g_hud_last_ns = now_ns(); g_hud_fresh = 1; droiddeck_on_game_frame(); }
+    if (s == g_hud_surface) {
+        g_hud_last_ns = now_ns();
+        g_hud_fresh = 1;
+        g_hud_commit_ns = g_hud_last_ns;
+        g_pace_commits++;
+        frame_hist_tick(&g_pace_commit, s, g_hud_last_ns);
+        droiddeck_on_game_frame();
+    }
 }
 
 /* ---- hooks for ahb_swapchain.c (zero-copy layers) */
@@ -2049,6 +2064,8 @@ static void render_scene(void) {
     int w, h;
     const int64_t t_scene = now_ns();
     int copy = 0; /* this scene went through the screen swapchain (the perf line's "copy") */
+    /* Whether this scene carries a game frame the screen has not shown yet (the pacing line). */
+    const struct surface *game = g_hud_fresh ? g_hud_surface : NULL;
 
     g_dirty = 0;
     g_hud_fresh = 0;
@@ -2220,6 +2237,11 @@ static void render_scene(void) {
     if (rendered) {
         int64_t t = now_ns();
         g_stat_frames++;
+        if (game && game == g_hud_surface) {
+            g_pace_shows++;
+            frame_hist_tick(&g_pace_shown, game, t);
+            if (g_hud_commit_ns && t >= g_hud_commit_ns) frame_hist_add(&g_pace_latency, t - g_hud_commit_ns);
+        }
         /* A surface outside the scene (role-less, not placed yet, a hidden helper window such
          * as wined3d's device window) was not shown, so its feedback is discarded rather than
          * left pending: a FIFO present waits on it, and a client blocked there never commits
@@ -3392,6 +3414,25 @@ static int on_stats_timer(void *data) {
 #undef PERF_MS
         memset(&g_perf, 0, sizeof(g_perf));
     }
+    /* The pacing line: the HUD window's frame intervals as the game committed them and as new frames
+     * reached the screen (p50/p95/p99/max; p99 is the "1 % low"), how many came 2x the median or later,
+     * and commit -> present. Frames committed but never shown were replaced by a newer one first. */
+    if (g_pace_commits) {
+        const struct frame_hist *c = &g_pace_commit, *v = &g_pace_shown, *l = &g_pace_latency;
+        droiddeck_log("pacing", "last 10 s: %u frames committed, interval p50/p95/p99/max %.1f/%.1f/%.1f/%.1f ms, "
+                   "%u at 2x p50 or longer | %u shown (%u never shown), interval p50/p95/p99/max %.1f/%.1f/%.1f/%.1f ms, "
+                   "%u at 2x p50 or longer | commit -> present p50/p95/max %.1f/%.1f/%.1f ms",
+                   g_pace_commits, frame_hist_ms(c, 50), frame_hist_ms(c, 95), frame_hist_ms(c, 99),
+                   (double)c->max_ns / 1e6, frame_hist_at_least(c, 2.0 * frame_hist_ms(c, 50)),
+                   g_pace_shows, g_pace_commits > g_pace_shows ? g_pace_commits - g_pace_shows : 0,
+                   frame_hist_ms(v, 50), frame_hist_ms(v, 95), frame_hist_ms(v, 99), (double)v->max_ns / 1e6,
+                   frame_hist_at_least(v, 2.0 * frame_hist_ms(v, 50)),
+                   frame_hist_ms(l, 50), frame_hist_ms(l, 95), (double)l->max_ns / 1e6);
+    }
+    frame_hist_window(&g_pace_commit);
+    frame_hist_window(&g_pace_shown);
+    frame_hist_window(&g_pace_latency);
+    g_pace_commits = g_pace_shows = 0;
     g_stat_frames = g_stat_dmabuf = g_stat_shm = 0;
     droiddeck_color_stats_tick(); /* HDR evidence for the same window (nothing when the HDR gate is closed) */
     /* A program that asked for dma-buf feedback (EGL's GPU path does, first thing) but has drawn
