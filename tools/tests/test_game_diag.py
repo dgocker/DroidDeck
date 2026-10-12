@@ -242,6 +242,100 @@ class GameDiagTest(unittest.TestCase):
         self.assertEqual(DIAG["exe_label"]("/root/Storage/Users/me/Game.exe"), "Game.exe")
 
 
+def fex_stats(threads, version=b"FEX-2609-137-g0df84d3", app_type=2):
+    """A stats file as FEX writes it (SHMStats.h, version 2): header, then threads linked by offset."""
+    header = DIAG["FEX_STATS_HEADER"]
+    thread = DIAG["FEX_THREAD"]
+    data = bytearray(header.size + thread.size * len(threads))
+    first = header.size if threads else 0
+    header.pack_into(data, 0, 2, app_type, thread.size, version, first, len(data), 0)
+    for i, (tid, counters) in enumerate(threads):
+        offset = header.size + i * thread.size
+        nxt = offset + thread.size if i + 1 < len(threads) else 0
+        thread.pack_into(data, offset, nxt, tid, *(list(counters) + [0] * (13 - len(counters))))
+    return bytes(data)
+
+
+class SamplerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.shm = root / "shm"
+        self.shm.mkdir()
+        self.sys = root / "sys"
+        for cpu, khz in ((0, 1800000), (1, 3300000)):
+            d = self.sys / ("devices/system/cpu/cpu%d/cpufreq" % cpu)
+            d.mkdir(parents=True)
+            (d / "scaling_cur_freq").write_text("%d\n" % khz)
+        (self.sys / "devices/system/cpu/cpufreq").mkdir(parents=True)  # not a cpuN entry
+        for z, (kind, temp) in enumerate((("cpu-0-0", 41000), ("gpu", 47500))):
+            d = self.sys / ("class/thermal/thermal_zone%d" % z)
+            d.mkdir(parents=True)
+            (d / "temp").write_text("%d\n" % temp)
+            (d / "type").write_text(kind + "\n")
+        self.base = str(root / "launch")
+
+    def rows(self, name):
+        lines = Path("%s.%s.csv" % (self.base, name)).read_text().splitlines()
+        head = lines[0].split(",")
+        return [dict(zip(head, line.split(","))) for line in lines[1:]]
+
+    def test_the_stats_format_is_read_as_fex_writes_it(self):
+        header, threads = DIAG["read_fex_stats"](fex_stats([(11, [5, 1, 2]), (12, [7, 0, 0, 3])]))
+        self.assertEqual(header, {"version": "FEX-2609-137-g0df84d3", "app_type": "arm64ec"})
+        self.assertEqual(threads[11][:3], (5, 1, 2))
+        self.assertEqual(threads[12][3], 3)
+        self.assertIsNone(DIAG["read_fex_stats"](b"short"))
+        wrong = bytearray(fex_stats([(1, [1])]))
+        wrong[0] = 3  # another version of the format
+        self.assertIsNone(DIAG["read_fex_stats"](bytes(wrong)))
+        # A loop in the list does not hang the reader.
+        looped = bytearray(fex_stats([(1, [1]), (2, [2])]))
+        DIAG["FEX_THREAD"].pack_into(looped, DIAG["FEX_STATS_HEADER"].size + DIAG["FEX_THREAD"].size, DIAG["FEX_STATS_HEADER"].size, 2, *([2] + [0] * 12))
+        self.assertEqual(sorted(DIAG["read_fex_stats"](bytes(looped))[1]), [1, 2])
+
+    def test_counters_add_up_across_threads_and_outlive_a_thread(self):
+        me = os.getpid()
+        stats = self.shm / ("fex-%d-stats" % me)
+        other = self.shm / "fex-1-stats"  # not in the game's tree
+        other.write_bytes(fex_stats([(1, [999])]))
+        sampler = DIAG["Sampler"](self.base, me, interval=3600, shm=str(self.shm), sys_root=str(self.sys))
+        stats.write_bytes(fex_stats([(100, [10, 0, 1]), (101, [5, 0, 0])]))
+        sampler.sample()
+        stats.write_bytes(fex_stats([(100, [30, 0, 4])]))   # thread 101 exited
+        sampler.sample()
+        stats.write_bytes(fex_stats([(100, [35, 0, 4]), (101, [2, 0, 0])]))  # slot 101 reused by a new thread
+        sampler.sample()
+        sampler.finish()
+        rows = self.rows("fex")
+        self.assertEqual([r["pid"] for r in rows], [str(me)] * 3)
+        self.assertEqual([r["jit_ticks"] for r in rows], ["15", "35", "42"])
+        self.assertEqual([r["sigbus"] for r in rows], ["1", "4", "4"])
+        self.assertEqual(rows[0]["app_type"], "arm64ec")
+        self.assertEqual(rows[0]["fex_version"], "FEX-2609-137-g0df84d3")
+        cpu = self.rows("cpu")
+        self.assertEqual((cpu[0]["cpu0_khz"], cpu[0]["cpu1_khz"]), ("1800000", "3300000"))
+        self.assertEqual((cpu[0]["thermal_max_millic"], cpu[0]["thermal_max_zone"]), ("47500", "gpu"))
+
+    def test_rows_stop_at_the_limit_and_unreadable_sources_are_skipped(self):
+        sampler = DIAG["Sampler"](self.base, os.getpid(), interval=3600, limit=100, shm=str(self.shm / "missing"),
+                                  sys_root=str(self.sys))
+        for _ in range(20):
+            sampler.sample()
+        written = sampler.finish()
+        self.assertLessEqual(written["cpu"], 100 + 40)
+        self.assertEqual(written["fex"], 0)
+        self.assertEqual(written["interval_s"], 3600)
+        self.assertFalse(Path(self.base + ".fex.csv").exists())
+
+    def test_the_interval_switch(self):
+        self.assertEqual(DIAG["sample_interval"]({}), DIAG["SAMPLE_INTERVAL"])
+        self.assertEqual(DIAG["sample_interval"]({"BL_DIAG_SAMPLE_INTERVAL": "0"}), 0.0)
+        self.assertEqual(DIAG["sample_interval"]({"BL_DIAG_SAMPLE_INTERVAL": "0.1"}), 1.0)
+        self.assertEqual(DIAG["sample_interval"]({"BL_DIAG_SAMPLE_INTERVAL": "x"}), DIAG["SAMPLE_INTERVAL"])
+
+
 class GameEnvRecordsTest(unittest.TestCase):
     """droiddeck-game-env end to end, with a fake Proton (a script) standing in for the game."""
 

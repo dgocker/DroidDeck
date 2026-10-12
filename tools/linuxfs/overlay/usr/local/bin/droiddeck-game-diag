@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -68,6 +69,15 @@ def output_cap(env):
     except (TypeError, ValueError):
         return DEFAULT_OUTPUT_CAP
     return max(0, min(cap, MAX_OUTPUT_CAP))
+
+
+def sample_interval(env):
+    """Seconds between samples of FEX's counters and the CPU (BL_DIAG_SAMPLE_INTERVAL); 0 turns them off."""
+    try:
+        value = float(env.get("BL_DIAG_SAMPLE_INTERVAL", SAMPLE_INTERVAL))
+    except (TypeError, ValueError):
+        return SAMPLE_INTERVAL
+    return 0.0 if value <= 0 else max(1.0, min(value, 600.0))
 
 
 def new_launch_id(now=None):
@@ -308,6 +318,172 @@ class Tee:
                 "cap": self.cap, "capped": self.capped, "complete": complete, "errors": self.errors[:8]}
 
 
+# FEX's live statistics (FEXCore/include/FEXCore/Utils/SHMStats.h, STATS_VERSION 2): a 64-byte header,
+# then a singly linked list of per-thread records by offset. Proton's FEX writes them when ProfileStats
+# is on, which the Config.json Proton ships turns on, to /dev/shm/fex-<pid>-stats.
+FEX_STATS_HEADER = struct.Struct("<BBH48sIII")
+FEX_THREAD = struct.Struct("<II13Q")
+FEX_COUNTERS = ("jit_ticks", "signal_ticks", "sigbus", "smc", "float_fallbacks", "cache_misses",
+                "cache_read_lock_ticks", "cache_write_lock_ticks", "jit_blocks", "disk_cache_hits",
+                "disk_cache_misses", "disk_cache_lookup_ticks")
+FEX_APP_TYPES = {0: "linux32", 1: "linux64", 2: "arm64ec", 3: "wow64"}
+SAMPLE_INTERVAL = 10.0
+SAMPLE_BYTES = 4 * 1024 * 1024
+
+
+def read_fex_stats(data):
+    """(header dict, {tid: counters}) from a stats file's bytes, or None when it is not one this reads."""
+    if len(data) < FEX_STATS_HEADER.size:
+        return None
+    version, app_type, thread_size, fex_version, head, size, _ = FEX_STATS_HEADER.unpack_from(data, 0)
+    if version != 2 or thread_size < FEX_THREAD.size:
+        return None
+    threads = {}
+    offset, seen = head, 0
+    while offset and offset + FEX_THREAD.size <= len(data) and seen <= len(data) // thread_size:
+        fields = FEX_THREAD.unpack_from(data, offset)
+        nxt, tid, counters = fields[0], fields[1], fields[2:2 + len(FEX_COUNTERS)]
+        if tid:
+            threads[tid] = counters
+        offset, seen = nxt, seen + 1
+    return {"version": fex_version.split(b"\0", 1)[0].decode("utf-8", "replace"),
+            "app_type": FEX_APP_TYPES.get(app_type, str(app_type))}, threads
+
+
+def parent_pid(pid):
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as f:
+            return int(f.read().rsplit(") ", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def in_tree(pid, root, cache):
+    """Whether [pid] descends from [root]; [cache] remembers answers within one sample."""
+    chain = []
+    while pid and pid > 1 and pid not in cache:
+        if pid == root:
+            cache[pid] = True
+            break
+        chain.append(pid)
+        pid = parent_pid(pid)
+    answer = cache.get(pid, False) if pid and pid > 1 else False
+    for p in chain:
+        cache[p] = answer
+    return answer
+
+
+def read_int(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+class Sampler:
+    """Every [interval] s, on a thread of its own: FEX's counters for each FEX process of the game (its
+    stats file, summed over threads; a thread that exits keeps what it had counted when last seen), and
+    the CPU clocks and the hottest thermal zone, where the kernel lets them be read. Rows go to
+    <id>.fex.csv and <id>.cpu.csv, up to [limit] bytes each. Nothing here touches the game's threads."""
+
+    def __init__(self, base, root_pid, interval=SAMPLE_INTERVAL, limit=SAMPLE_BYTES, shm="/dev/shm", sys_root="/sys"):
+        self.base, self.root, self.interval, self.limit, self.shm, self.sys = base, root_pid, interval, limit, shm, sys_root
+        self.started = time.monotonic()
+        self.seen = {}      # (pid, tid) -> last counters
+        self.totals = {}    # pid -> summed counters
+        self.files = {}
+        self.written = {}
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.loop, name="diag-sampler", daemon=True)
+        self.cpus = sorted(int(n[3:]) for n in self.listdir(os.path.join(sys_root, "devices/system/cpu")) if re.fullmatch(r"cpu\d+", n))
+
+    @staticmethod
+    def listdir(path):
+        try:
+            return os.listdir(path)
+        except OSError:
+            return []
+
+    def start(self):
+        self.thread.start()
+
+    def finish(self, timeout=2.0):
+        self.stop.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout)
+        for f in self.files.values():
+            try:
+                f.close()
+            except OSError:
+                pass
+        return dict({name: self.written.get(name, 0) for name in ("fex", "cpu")}, interval_s=self.interval)
+
+    def loop(self):
+        while not self.stop.wait(self.interval):
+            self.sample()
+        self.sample()
+
+    def write(self, name, header, row):
+        f = self.files.get(name)
+        if f is None:
+            try:
+                f = self.files[name] = open("%s.%s.csv" % (self.base, name), "w", encoding="utf-8")
+                f.write(header + "\n")
+            except OSError:
+                self.files[name] = f = None
+                return
+        if f is None or self.written.get(name, 0) >= self.limit:
+            return
+        line = row + "\n"
+        try:
+            f.write(line)
+            f.flush()
+            self.written[name] = self.written.get(name, 0) + len(line)
+        except OSError:
+            pass
+
+    def sample(self):
+        t = "%.1f" % (time.monotonic() - self.started)
+        cache = {}
+        for name in sorted(self.listdir(self.shm)):
+            m = re.fullmatch(r"fex-(\d+)-stats", name)
+            if not m or not in_tree(int(m.group(1)), self.root, cache):
+                continue
+            pid = int(m.group(1))
+            try:
+                with open(os.path.join(self.shm, name), "rb") as f:
+                    parsed = read_fex_stats(f.read(1024 * 1024))
+            except OSError:
+                continue
+            if parsed is None:
+                continue
+            header, threads = parsed
+            total = self.totals.setdefault(pid, [0] * len(FEX_COUNTERS))
+            for tid, counters in threads.items():
+                last = self.seen.get((pid, tid), (0,) * len(FEX_COUNTERS))
+                for i, (now, before) in enumerate(zip(counters, last)):
+                    total[i] += now - before if now >= before else now  # a reused slot starts again from 0
+                self.seen[(pid, tid)] = counters
+            self.write("fex", "t_s,pid,app_type,fex_version,threads," + ",".join(FEX_COUNTERS),
+                       ",".join([t, str(pid), header["app_type"], header["version"], str(len(threads))] + [str(v) for v in total]))
+        freqs = [read_int(os.path.join(self.sys, "devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq" % c)) for c in self.cpus]
+        hottest, zone = None, ""
+        thermal = os.path.join(self.sys, "class/thermal")
+        for z in sorted(self.listdir(thermal)):
+            temp = read_int(os.path.join(thermal, z, "temp"))
+            if temp is not None and (hottest is None or temp > hottest):
+                hottest = temp
+                try:
+                    with open(os.path.join(thermal, z, "type"), encoding="utf-8") as f:
+                        zone = f.read().strip().replace(",", " ")
+                except OSError:
+                    zone = z
+        if any(v is not None for v in freqs) or hottest is not None:
+            self.write("cpu", "t_s," + ",".join("cpu%d_khz" % c for c in self.cpus) + ",thermal_max_millic,thermal_max_zone",
+                       ",".join([t] + ["" if v is None else str(v) for v in freqs] + ["" if hottest is None else str(hottest), zone]))
+
+
 def decode_status(status):
     if os.WIFSIGNALED(status):
         sig = os.WTERMSIG(status)
@@ -405,6 +581,14 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
         if tee:
             tee.child_started()
             tee.start()
+        sampler = None
+        interval = sample_interval(env)
+        if child is not None and interval > 0:
+            try:
+                sampler = Sampler(base, child.pid, interval)
+                sampler.start()
+            except (OSError, RuntimeError):
+                sampler = None
         for name in list(pending):
             number = getattr(signal, name, None)
             if child is not None and number is not None:
@@ -454,6 +638,7 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
         ended_boot = boot_ns()
         if tee:
             output = tee.finish(tee_timeout)
+        samples = sampler.finish() if sampler else None
         record = {
             "schema": SCHEMA,
             "launch_id": launch_id,
@@ -468,6 +653,7 @@ def run(command, env, meta, directory, stock=None, on_stock=None, popen=subproce
             "reported_status": code,
             "session_log_offset": file_size(env.get("BL_LOG")),
             "output": output,
+            "samples": samples,
         }
         record.update(decoded)
         write_record(base + ".exit.json", record)

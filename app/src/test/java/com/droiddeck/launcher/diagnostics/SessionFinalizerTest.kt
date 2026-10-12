@@ -256,6 +256,43 @@ class SessionFinalizerTest {
     }
 
     @Test
+    fun fexAndCpuSamplesComeInWithMillisecondsWhenTheTimerIsKnown() {
+        val launch = launcher.start(output = "x\n")
+        File(store.inbox, "${launch.id}.fex.csv").writeText(
+            "t_s,pid,app_type,fex_version,threads,jit_ticks,signal_ticks,sigbus\n" +
+                "10.0,500,arm64ec,FEX-2609,12,19200000,96000,7\n20.0,500,arm64ec,FEX-2609,12,19392000,96000,9\n")
+        File(store.inbox, "${launch.id}.cpu.csv").writeText("t_s,cpu0_khz,thermal_max_millic,thermal_max_zone\n10.0,3300000,45000,cpu-0\n")
+        launcher.exit(launch, code = 0, sampled = true)
+        val s = finalizer.finalize(LaunchRecords(store.inbox, launch.id), LaunchState(sessionEnded = true), HostSources(),
+            SessionInfo(device = mapOf("counter_hz" to 19_200_000L)))!!
+        val fex = File(s.dir, "fex_stats.csv").readLines()
+        assertEquals("t_s,pid,app_type,fex_version,threads,jit_ticks,signal_ticks,sigbus,jit_ms,signal_ms", fex[0])
+        assertEquals("10.0,500,arm64ec,FEX-2609,12,19200000,96000,7,1000.000,5.000", fex[1])
+        assertEquals("1010.000", fex[2].split(",")[8])
+        assertEquals("10.0,3300000,45000,cpu-0", File(s.dir, "cpu.csv").readLines()[1])
+        assertFalse(File(store.inbox, "${launch.id}.fex.csv").exists())
+        assertFalse(missing(s).containsKey("fex_stats.csv"))
+        assertTrue(JSONObject(File(s.dir, "manifest.json").readText()).toString().contains("every 5 s"))
+    }
+
+    @Test
+    fun withoutSamplesTheManifestSaysWhy() {
+        val sampledOff = launcher.start(output = "x\n")
+        launcher.exit(sampledOff, code = 0, sampled = false)
+        assertTrue(missing(finish(sampledOff)!!)["fex_stats.csv"]!!.contains("took no samples"))
+        val noFex = launcher.start(output = "x\n", startMs = t0 + 10)
+        launcher.exit(noFex, code = 0, sampled = true)
+        val s = finish(noFex)!!
+        assertTrue(missing(s)["fex_stats.csv"]!!.contains("FEX wrote no statistics"))
+        assertTrue(missing(s)["cpu.csv"]!!.contains("did not let"))
+        // Without the timer's frequency the ticks stay as they are.
+        val ticks = launcher.start(output = "x\n", startMs = t0 + 20)
+        File(store.inbox, "${ticks.id}.fex.csv").writeText("t_s,jit_ticks\n10.0,5\n")
+        launcher.exit(ticks, code = 0, sampled = true)
+        assertEquals("t_s,jit_ticks", File(finish(ticks)!!.dir, "fex_stats.csv").readLines()[0])
+    }
+
+    @Test
     fun retentionKeepsTheNewestPerGameAndStaysUnderTheTotal() {
         val limits = DiagnosticsLimits(sessionsPerGame = 3, totalBytes = Long.MAX_VALUE)
         repeat(5) { i ->

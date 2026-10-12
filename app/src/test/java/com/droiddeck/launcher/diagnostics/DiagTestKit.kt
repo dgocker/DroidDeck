@@ -47,7 +47,7 @@ class FakeLauncher(val inbox: File) {
     fun exit(
         launch: Launch, code: Int? = 0, signal: Int? = null, signalName: String? = null, durationMs: Long = 60_000,
         forwarded: List<String> = emptyList(), launchFailed: Boolean = false, coreDumped: Boolean = false,
-        outputBytes: Long = launch.output.length(), capped: Boolean = false,
+        outputBytes: Long = launch.output.length(), capped: Boolean = false, sampled: Boolean = false,
     ) {
         val json = JSONObject()
             .put("schema", 1).put("launch_id", launch.id)
@@ -59,6 +59,7 @@ class FakeLauncher(val inbox: File) {
             .put("exec_errors", if (launchFailed) JSONArray().put(JSONObject().put("program", "proton").put("error", "[Errno 2] No such file").put("errno", 2)) else JSONArray())
             .put("forwarded_signals", JSONArray(forwarded))
             .put("output", JSONObject().put("bytes_seen", outputBytes).put("bytes_kept", outputBytes).put("capped", capped).put("complete", true).put("errors", JSONArray()))
+            .put("samples", if (sampled) JSONObject().put("fex", 100).put("cpu", 100).put("interval_s", 5.0) else JSONObject.NULL)
         File(inbox, "${launch.id}.exit.json").writeText(json.toString())
     }
 }

@@ -386,6 +386,7 @@ object DiagnosticsManager {
         "kernel" to System.getProperty("os.version"),
         "page_size" to try { android.system.Os.sysconf(android.system.OsConstants._SC_PAGESIZE) } catch (e: Exception) { null },
         "abis" to Build.SUPPORTED_ABIS.toList(),
+        "counter_hz" to try { com.droiddeck.launcher.wayland.WaylandCompositor.nativeCounterFrequency().takeIf { it > 0 } } catch (t: Throwable) { null },
     )
 
     private fun buildInfo(): Map<String, Any?> = mapOf(

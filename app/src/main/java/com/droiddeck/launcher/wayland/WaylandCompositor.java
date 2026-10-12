@@ -464,6 +464,10 @@ public final class WaylandCompositor {
      *  unlike android.os.Process.setThreadPriority). Returns the nice it is left at; 100 = unknown. */
     public static native int nativeRaisePriority(int tid, int nice);
 
+    /** CNTFRQ_EL0: the ARM generic timer's frequency in Hz, the unit of FEX's live statistics; 0 when
+     *  the CPU has none. */
+    public static native long nativeCounterFrequency();
+
     /** Inject the app's X-server input in scene (virtual desktop) pixels. type 2 = move to a,b;
      *  3 = evdev button a (BTN_LEFT=0x110…) pressed (b=1) or released (b=0); 4 = a wheel steps,
      *  negative = up. */

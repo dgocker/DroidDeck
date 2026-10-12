@@ -146,6 +146,23 @@ class SessionFinalizer(
             missing.putIfAbsent("vulkan.log", "no game output to take Vulkan lines from")
         }
 
+        // FEX's own counters (JIT time, SIGBUS, SMC, x87 fallbacks...) and the CPU's clocks, as the launcher
+        // sampled them every 10 s: the JIT time per window tells compiling from running.
+        val samples = exit?.json?.optJSONObject("samples")
+        val counterHz = (info.device["counter_hz"] as? Number)?.toLong()?.takeIf { it > 0 }
+        val every = samples?.optDouble("interval_s")?.takeIf { it > 0 }?.let { String.format(java.util.Locale.US, "%.0f", it) } ?: "10"
+        takeSamples(records.fexStatsFile, File(dir, "fex_stats.csv"), counterHz, described, missing, warnings,
+            "FEX's live statistics (FEXCore SHMStats) for each FEX process of the game, summed over its threads, every $every s" +
+                if (counterHz != null) "; *_ms columns from the timer's $counterHz Hz" else "; times in timer ticks (the timer frequency was not known)",
+            when {
+                exit != null && samples == null -> "the launcher took no samples (BL_DIAG_SAMPLE_INTERVAL=0, or a launcher from before sampling)"
+                start.launcher == "native" -> "not run under FEX"
+                else -> "FEX wrote no statistics for the game's processes (ProfileStats off in its configuration, or /dev/shm not writable)"
+            })
+        takeSamples(records.cpuFile, File(dir, "cpu.csv"), null, described, missing, warnings,
+            "each CPU's current clock and the hottest thermal zone, every $every s, as sysfs gave them",
+            if (exit != null && samples == null) "the launcher took no samples" else "the kernel did not let the CPU clocks or thermal zones be read")
+
         // The verdict, with what the output says.
         val verdict = ExitClassifier.classify(ExitFacts(exit, scan?.crashEvidence, state.processAlive, state.sessionEnded, state.appRestarted, state.rebooted))
         if (!verdict.status.problem) File(dir, "crash/$CRASH_REPORT").delete()
@@ -344,6 +361,43 @@ class SessionFinalizer(
         return store.session(key, id)
     }
 
+    /**
+     * A sample file from the inbox into the launch's folder, with a `<name>_ms` column after every
+     * `<name>_ticks` one when the timer frequency is known. Missing or empty: named under "missing".
+     */
+    private fun takeSamples(
+        src: File, dst: File, counterHz: Long?, described: MutableMap<String, String>, missing: MutableMap<String, String>,
+        warnings: MutableList<String>, describe: String, why: String,
+    ) {
+        if (!src.isFile || src.length() == 0L) {
+            if (!dst.isFile) missing[dst.name] = why
+            return
+        }
+        try {
+            dst.bufferedWriter().use { out ->
+                src.bufferedReader().useLines { lines ->
+                    var ticks = emptyList<Int>()
+                    lines.forEachIndexed { i, line ->
+                        val cells = line.split(',')
+                        if (i == 0) ticks = cells.indices.filter { cells[it].endsWith("_ticks") && counterHz != null }
+                        val extra = ticks.map { c ->
+                            if (i == 0) cells[c].removeSuffix("_ticks") + "_ms"
+                            else cells.getOrNull(c)?.toLongOrNull()?.let { String.format(java.util.Locale.US, "%.3f", it * 1000.0 / counterHz!!) }.orEmpty()
+                        }
+                        out.write((cells + extra).joinToString(","))
+                        out.write("\n")
+                    }
+                }
+            }
+            src.delete()
+            described[dst.name] = describe
+        } catch (e: IOException) {
+            dst.delete()
+            missing[dst.name] = "could not be moved in: ${e.message}"
+            warnings += "${dst.name}: ${e.message}"
+        }
+    }
+
     private fun hostJson(s: HostSources) = JSONObject()
         .put("id", s.hostSession ?: JSONObject.NULL)
         .put("compositor_log", s.waylandLog?.isFile == true)
@@ -409,6 +463,6 @@ class SessionFinalizer(
         const val SCHEMA_VERSION = 1
         const val CRASH_REPORT = "game-crash-report.txt"
         /** The files a launch's folder is expected to hold; any not there is named under "missing". */
-        val EXPECTED = listOf("session.log", "android.log", "wayland.log", "fex.log", "vulkan.log", "performance.csv", "process_exit.json")
+        val EXPECTED = listOf("session.log", "android.log", "wayland.log", "fex.log", "vulkan.log", "performance.csv", "fex_stats.csv", "cpu.csv", "process_exit.json")
     }
 }

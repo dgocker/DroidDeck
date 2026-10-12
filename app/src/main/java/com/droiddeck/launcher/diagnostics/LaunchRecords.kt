@@ -13,9 +13,14 @@ class LaunchRecords(val dir: File, val id: String) {
     val exitFile get() = File(dir, "$id.exit.json")
     val outputFile get() = File(dir, "$id.out.log")
     val ownerFile get() = File(dir, "$id.owner")
+    /** FEX's counters for the game's processes, sampled by the launcher. */
+    val fexStatsFile get() = File(dir, "$id.fex.csv")
+    /** CPU clocks and the hottest thermal zone, sampled by the launcher. */
+    val cpuFile get() = File(dir, "$id.cpu.csv")
 
     /** Everything of this launch in the inbox, records and output. */
-    fun files(): List<File> = listOf(startFile, exitFile, outputFile, ownerFile, File(dir, "$id.start.json.tmp"), File(dir, "$id.exit.json.tmp"))
+    fun files(): List<File> = listOf(startFile, exitFile, outputFile, ownerFile, fexStatsFile, cpuFile,
+        File(dir, "$id.start.json.tmp"), File(dir, "$id.exit.json.tmp"))
 
     fun start(): Start? = read(startFile)?.let { Start(it) }
     fun exit(): Exit? = read(exitFile)?.let { Exit(it) }

@@ -702,6 +702,21 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetGpuTurbo(JNIEnv *
     adrenotools_set_turbo(on == JNI_TRUE);
 }
 
+/* The frequency of the ARM generic timer (CNTFRQ_EL0), in Hz: the unit FEX's live statistics count
+ * time in (they read CNTVCT_EL0), so game diagnostics can turn those ticks into milliseconds. 0 where
+ * there is no such register. */
+JNIEXPORT jlong JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCounterFrequency(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+#if defined(__aarch64__)
+    uint64_t hz;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+    return (jlong)hz;
+#else
+    return 0;
+#endif
+}
+
 /* Raises one of our own processes or threads to `nice` with a bare setpriority(), never lowering
  * it. android.os.Process.setThreadPriority is not used for this: it also moves the thread between
  * scheduling groups by priority, and a guest process must stay where Android put the app. Returns
