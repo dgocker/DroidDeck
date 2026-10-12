@@ -23,6 +23,7 @@ add_library(droiddeckwayland SHARED
         src/blend_pass.c
         src/frame_stats.c
         src/input_queue.c
+        src/vsync_period.c
         generated/color-management-v1-protocol.c
         generated/xdg-shell-protocol.c
         generated/linux-dmabuf-v1-protocol.c

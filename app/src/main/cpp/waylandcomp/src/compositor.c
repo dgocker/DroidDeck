@@ -55,6 +55,7 @@
 #include "compositor_internal.h"
 #include "frame_stats.h"
 #include "input_queue.h"
+#include "vsync_period.h"
 
 #define WLOGI(...) __android_log_print(ANDROID_LOG_INFO, "DroidDeckWayland", __VA_ARGS__)
 #define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, "DroidDeckWayland", __VA_ARGS__)
@@ -293,7 +294,8 @@ static struct wl_event_source *g_render_idle, *g_frame_timer;
  * window) a fallback timer renders instead. */
 static int g_dirty;                         /* something changed since the last render */
 static int64_t g_last_vsync_ns;             /* last tick, 0 = none yet */
-static int64_t g_refresh_ns = 16666667;     /* measured tick interval (pacing only, never reported) */
+static int64_t g_refresh_ns = 16666667;     /* refresh period from the ticks' frame times (pacing) */
+static struct vsync_period g_vsync;         /* how g_refresh_ns is measured (vsync_period.h) */
 static struct wl_event_source *g_fallback_timer;
 static int g_fallback_armed;
 
@@ -2301,12 +2303,11 @@ static int scene_waits_for_game(int64_t now) {
 static void on_vsync(int64_t frame_time_ns) {
     int64_t now = now_ns();
     g_perf.ticks++;
-    if (g_last_vsync_ns) {
-        int64_t d = now - g_last_vsync_ns;
-        if (d > 3000000LL && d < 40000000LL) g_refresh_ns = (g_refresh_ns * 7 + d) / 8;
-    }
+    /* The period from the Choreographer's frame times (System.nanoTime, CLOCK_MONOTONIC), not from when
+     * this thread got to the tick, which a long frame here delays. */
+    const int64_t period = vsync_period_tick(&g_vsync, frame_time_ns > 0 ? frame_time_ns : now);
+    if (period > 0) g_refresh_ns = period;
     g_last_vsync_ns = now;
-    (void)frame_time_ns;
     /* The app's surface may have been replaced or taken away since the last frame: apply that now
      * (the app never waits for us), and redraw the scene onto a new one. */
     if (vkp_apply_window_request()) g_dirty = 1;
@@ -3414,13 +3415,16 @@ static int on_stats_timer(void *data) {
         const struct frame_hist *c = &g_pace_commit, *v = &g_pace_shown, *l = &g_pace_latency;
         droiddeck_log("pacing", "last 10 s: %u frames committed, interval p50/p95/p99/max %.1f/%.1f/%.1f/%.1f ms, "
                    "%u at 2x p50 or longer | %u shown (%u never shown), interval p50/p95/p99/max %.1f/%.1f/%.1f/%.1f ms, "
-                   "%u at 2x p50 or longer | commit -> present p50/p95/max %.1f/%.1f/%.1f ms",
+                   "%u at 2x p50 or longer | commit -> present p50/p95/max %.1f/%.1f/%.1f ms | "
+                   "panel %.1f Hz nominal, vsync %.2f ms measured, fps limit %d, layer mode %s",
                    g_pace_commits, frame_hist_ms(c, 50), frame_hist_ms(c, 95), frame_hist_ms(c, 99),
                    (double)c->max_ns / 1e6, frame_hist_at_least(c, 2.0 * frame_hist_ms(c, 50)),
                    g_pace_shows, g_pace_commits > g_pace_shows ? g_pace_commits - g_pace_shows : 0,
                    frame_hist_ms(v, 50), frame_hist_ms(v, 95), frame_hist_ms(v, 99), (double)v->max_ns / 1e6,
                    frame_hist_at_least(v, 2.0 * frame_hist_ms(v, 50)),
-                   frame_hist_ms(l, 50), frame_hist_ms(l, 95), (double)l->max_ns / 1e6);
+                   frame_hist_ms(l, 50), frame_hist_ms(l, 95), (double)l->max_ns / 1e6,
+                   1e9 / (double)nominal_refresh_ns(), (double)g_refresh_ns / 1e6, g_fps_limit,
+                   g_zero_copy ? "on" : "off");
     }
     /* Input that found the pipe full (the compositor thread was busy): only when there was any. */
     {
